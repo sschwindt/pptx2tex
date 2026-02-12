@@ -1,0 +1,594 @@
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{beamerthemelww}[2025-05-02 Sebastian Schwindt -- LWW-IWS Beamer Theme]
+
+% === Core packages ==========================================================
+\RequirePackage{tikz}
+\usetikzlibrary{3d,angles,arrows.meta,calc,intersections,positioning,shadows.blur,shapes.geometric,shapes.symbols}
+\RequirePackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepgfplotslibrary{fillbetween}
+\pgfdeclarelayer{bg}
+\RequirePackage{helvet}
+\RequirePackage{xcolor}
+\RequirePackage{graphicx}
+\RequirePackage{hyperref}
+\RequirePackage{varwidth}
+\RequirePackage{movie15}
+\RequirePackage{latexsym}
+\RequirePackage{amsmath,amssymb,amsfonts}
+\RequirePackage{wrapfig}
+\RequirePackage{setspace}
+\RequirePackage{anyfontsize}
+\RequirePackage{epsfig}
+% --- Work‑around for enumitem+beamer loop (missing \labelenumi) ---
+\makeatletter
+\@ifundefined{labelenumi}{\def\labelenumi{\arabic{enumi}.}}{}
+\@ifundefined{labelenumii}{\def\labelenumii{\alph{enumii})}}{}
+\@ifundefined{labelenumiii}{\def\labelenumiii{\roman{enumiii}.}}{}
+\@ifundefined{labelenumiv}{\def\labelenumiv{\Alph{enumiv}.}}{}
+\makeatother
+% ------------------------------------------------------------------
+\RequirePackage{enumitem}
+\RequirePackage{tcolorbox}
+\RequirePackage{textpos}
+\RequirePackage{caption}
+\RequirePackage{perpage}
+\RequirePackage{fancyhdr}
+\RequirePackage{xkeyval}
+\RequirePackage{colortbl}
+\RequirePackage{tabularray}
+\RequirePackage{pifont}
+\RequirePackage{float}
+\RequirePackage{alltt}
+\RequirePackage{fontawesome}
+
+% Defer link color setup until after color definitions
+\AtBeginDocument{
+  \hypersetup{
+    colorlinks=true,
+    linkcolor=unisblue,
+    urlcolor=unisblue,
+    citecolor=blue_med
+  }
+}
+
+% === set up table of contents (toc) ===
+% control font sizes
+\setbeamerfont{section in toc}{size=\normalsize}
+\setbeamerfont{subsection in toc}{size=\normalsize}
+
+% section toc styles
+\setbeamertemplate{section in toc}{%
+  \vspace{0.5em}%
+  \inserttocsection\par
+}
+
+% subsections with smaller bullets (indented)
+\setbeamertemplate{subsection in toc}{%
+  \hspace{1.5em}{\small$\circ$}~\inserttocsubsection\par
+}
+
+% === Begin presentation mode ===============================================
+\mode<presentation>
+
+% Requirement
+\pgfplotsset{compat=1.11}
+\usepgfplotslibrary{fillbetween}
+\pgfdeclarelayer{bg}
+\pgfsetlayers{bg,main}
+
+% enable gaps on slide handouts
+% EXAMPLE USAGE:
+% \begin{handoutframeselect}[1]
+% \begin{frame}<\slideselection{1}>{boring frame title}
+% FRAMECONTENTS
+% \end{frame}
+% \end{handoutframeselect}
+\makeatletter
+\newif\ifOnBeamerModeTransition
+\newcommand{\slideselection}[1]{#1}%
+\newenvironment{handoutframeselect}[1][1-]{%
+  \begingroup%
+  \mode<handout>{%
+    \gdef\beamer@currentmode{beamer}%
+    \OnBeamerModeTransitiontrue%
+    \renewcommand{\slideselection}[1]{#1}}%
+}{%
+  \ifOnBeamerModeTransition%
+    \OnBeamerModeTransitionfalse%
+    \gdef\beamer@currentmode{handout}%
+  \fi%
+  \endgroup%
+}
+\makeatother
+
+% Settings
+%\useinnertheme{unistuttgart}
+%\useoutertheme{unistuttgart}
+%\usecolortheme{unistuttgart}
+
+% disable navigation symbols
+\setbeamertemplate{navigation symbols}{}
+% usage:
+% \begin{textblock*}{width}(xcoord,ycoord)
+% whatever you want to put here
+% \end{textblock*}
+
+% Global Background
+% {
+% \usebackgroundtemplate{\includegraphics[width=\paperwidth]{cache-creek.jpg}}%
+% \begin{frame}{Cache-Creek}
+% ...
+% \end{frame}
+% }
+
+% headers and footers
+\MakePerPage{footnote}
+\renewcommand*{\thefootnote}{\fnsymbol{footnote}}
+\renewcommand\footnoterule{}
+
+\def\framesource{}
+\newcommand{\source}[1]{\global\def\framesource{#1}}
+
+\defbeamertemplate{footline}{uni stuttgart footline}
+{
+  \begin{minipage}[b][0.05\paperheight][t]{\paperwidth}
+    \hspace{0.08\paperheight}University of Stuttgart%
+    \ifx\framesource\empty\else
+      \hspace{1em}{\color{gray}Source: \framesource}%
+    \fi
+    \hfill \insertframenumber\hspace{0.08\paperheight}
+  \end{minipage}
+  \global\def\framesource{}% reset for next frame
+}
+
+%\setbeamerfont{footline}{size=\fontsize{5}{6}\selectfont}
+\setbeamertemplate{footline}[uni stuttgart footline]
+
+% enable line breaks in tables
+\newcommand{\specialcell}[2][l]{\begin{tabular}[#1]{@{}l@{}}#2\end{tabular}}
+
+
+% colors and fonts
+\definecolor{anthrazit}{RGB}{62,68,76}
+\definecolor{unisblue}{RGB}{0,81,158}
+\definecolor{hellblau}{RGB}{0,190,255}
+\definecolor{red}{rgb}{1,0,0}
+\definecolor{red_warm}{rgb}{0.69,0.17,0.17}
+
+\definecolor{orange_light}{rgb}{1,0.85,0.6}
+\definecolor{orange_med}{rgb}{0.753,0.62,0.373}
+\definecolor{orange_dark}{rgb}{0.506,0.412,0.251}
+
+\definecolor{green_lightlight}{rgb}{0.93,1,0.8}
+\definecolor{green_light}{rgb}{0.85,1,0.6}
+\definecolor{green_med}{rgb}{0.635,0.745,0.376}
+\definecolor{green_dark}{rgb}{0.0745,0.42,0.114}
+\definecolor{green_warm}{rgb}{0.18,0.69,0.24}
+
+\definecolor{blue_lightlight}{rgb}{0.92,0.98,1}
+\definecolor{blue_light}{rgb}{0.85,0.95,1}
+\definecolor{blue_med}{rgb}{0.365,0.624,0.749}
+\definecolor{blue_dark}{rgb}{0.251,0.42,0.502}
+
+\definecolor{pink_light}{rgb}{1,0.85,0.99}
+\definecolor{pink_med}{rgb}{0.745,0.38,0.62}
+\definecolor{pink_dark}{rgb}{0.498,0.255,0.416}
+
+\definecolor{yellow_light}{rgb}{1,1,0.8}
+\definecolor{yellow_med}{rgb}{0.757,0.745,0.373}
+\definecolor{yellow_dark}{rgb}{0.506,0.49,0.251}
+\definecolor{yellow_warm}{rgb}{0.97,0.898,0.3177}
+
+\definecolor{lightlight_gray}{gray}{0.95}
+\definecolor{light_gray}{gray}{0.9 }
+\definecolor{med_gray}{gray}{0.85}
+
+\definecolor{lwwblue}{RGB}{130, 176, 226}
+\definecolor{blue}{rgb}{0,0,1} % URL blue
+
+\setbeamercolor{title}{fg=white}
+\setbeamercolor{date}{fg=white}
+\setbeamerfont{date}{size=\usebeamerfont{subtitle}}
+
+\setbeamerfont{frametitle}{series=\bfseries,size=\normalsize}
+\setbeamercolor{frametitle}{fg=anthrazit}
+
+\setbeamerfont{framesubtitle}{size=\normalfont\small}
+\setbeamercolor{framesubtitle}{fg=anthrazit}
+
+\setbeamerfont{structure}{size=\small}
+\setbeamercolor{structure}{fg=unisblue}
+
+\setbeamerfont{normal text}{size=\normalfont\small}
+\setbeamercolor{normal text}{fg=anthrazit!70!black} % text is darker than in standard template (readability)
+
+
+\setbeamercolor{alerted text}{fg=unisblue}
+\setbeamercolor{caption name}{fg=unisblue}
+\setbeamercolor{itemize item}{fg=unisblue}
+\setbeamercolor{itemize subitem}{fg=anthrazit}
+\setbeamercolor{enumerate item}{fg=unisblue}
+\setbeamercolor{enumerate subitem}{fg=anthrazit}
+\setbeamercolor{description item}{fg=anthrazit}
+\setbeamercolor{block title}{fg=white,bg=anthrazit}
+\setbeamercolor{block body}{fg=anthrazit!70!black,bg=anthrazit!10!white}
+
+\setbeamertemplate{itemize items}{\tikz{\path (0,0); \fill (0em,0.36em) circle (0.13em);}}
+
+
+% use fancy enumerate/itemize and restore beamer layout
+\setitemize[1]{%
+  label={\usebeamerfont*{itemize item}\usebeamercolor[fg]{itemize item}\usebeamertemplate{itemize item}},
+  labelindent=0pt,
+  labelsep=0.6em,
+  leftmargin=*,
+  itemsep=0.2em,
+  topsep=0.2em,
+}
+% boarders
+\setbeamersize{text margin left=0.08\paperheight,text margin right=0.08\paperheight}
+
+% slide (frame) title
+\setbeamertemplate{frametitle}
+{\vskip 0.06\paperheight
+  \leavevmode
+  \large\textcolor{anthrazit}{\insertframetitle}
+}
+
+
+% show chapter names
+\AtBeginSection[]{
+	\newchapter{\insertsectionhead}
+}
+
+% lww-logo on contents (lww-specific)
+\setbeamertemplate{background}{
+	\begin{tikzpicture}
+		\clip (0,0) rectangle (\paperwidth,\paperheight);
+		% logo
+		\node at (\paperwidth,\paperheight) [yshift=-0.09\paperheight,xshift=-0.1\paperheight]{
+		\includegraphics[height=0.1\paperheight]{theme/logos/lww-logo.png}};
+		%\fill [white,opacity=0.7] (0,0) rectangle (\paperwidth,\paperheight);
+	\end{tikzpicture}
+}
+
+% title page
+\renewcommand{\maketitle}
+{
+	{
+	\setbeamertemplate{footline}{} % No page number
+	\setbeamertemplate{background}{
+		\begin{tikzpicture}
+			% clip everything to the screen (to control alignment absolutely)
+			\clip (0,0) rectangle (\paperwidth,\paperheight);
+
+			% Background image
+			\node at (0,\paperheight)[xshift=-0.01\paperheight,yshift=-0.25\paperheight,anchor=north west]
+				{\includegraphics[width=\paperwidth]{theme/title-background.jpg}};
+
+			% Uni Stuttgart logo
+			\node at (0,\paperheight)[xshift=-0.055\paperheight,yshift=0.06\paperheight,anchor=north west]
+				{\includegraphics[height=0.29\paperheight]{theme/logos/unistuttgart_logo_englisch.pdf}};
+
+			% large gray circle (for title)
+			\fill[anthrazit,opacity=0.85,xshift=-0.36\paperheight] (\paperwidth,0.47\paperheight) circle (0.315\paperheight);
+
+			% small white circle (for logo)
+			\fill[white,opacity=0.815,xshift=-0.2\paperheight] (\paperwidth,0.2\paperheight) circle (0.09\paperheight);
+			% place lww-logo in circle
+			\node at (\paperwidth,0.2\paperheight)[xshift=-0.2\paperheight]{
+			\includegraphics[height=0.1\paperheight]{theme/logos/lww-logo.png}};
+
+			% title, name and subtitle
+			\node[anchor=south west,xshift=-0.61\paperheight,white,align=left,text width=0.48\paperheight] at (\paperwidth,0.45\paperheight){{\bf \large \inserttitle\par}};
+			\node[anchor=north west,xshift=-0.61\paperheight,white,align=left,text width=0.48\paperheight] at (\paperwidth,0.425\paperheight){{\bf \tiny \insertsubtitle\par}};
+			\node[anchor=north west,xshift=-0.61\paperheight,lwwblue,align=left,text width=0.48\paperheight] at (\paperwidth,0.35\paperheight){{\bf \scriptsize \insertauthor\par}};
+		\end{tikzpicture}
+	}
+		\frame{}
+	}
+	\clearpage
+	\setcounter{framenumber}{0}
+}
+
+
+% chapter
+\newcommand{\newchapter}[1]
+{
+	{
+	\setbeamertemplate{footline}{} % no page number
+	\setbeamertemplate{background}{
+		\begin{tikzpicture}
+			% clip everything to the screen (to control alignment absolutely)
+			\clip (0,0) rectangle (\paperwidth,\paperheight);
+			\fill[shading = axis, left color = unisblue, right color = hellblau, shading angle = 135] (0,0) rectangle (\paperwidth,\paperheight);
+
+			\fill[white](0.5\paperwidth,0.9\paperheight) circle (0.375\paperwidth);
+			\node at (0.5\paperwidth,0.65\paperheight) [anchor=south]{\bf \begin{varwidth}{0.6\paperwidth}\huge #1\par\end{varwidth}};
+		\end{tikzpicture}
+	}
+	\frame[plain,noframenumbering]{}
+	}
+	\clearpage
+}
+
+
+% thank-you white
+\newcommand{\thankyou}[5]
+{
+	{
+	\setbeamertemplate{footline}{} % No page number
+	\setbeamertemplate{background}{
+		\begin{tikzpicture}
+			% clip everything to the screen (to control alignment absolutely)
+			\clip (0,0) rectangle (\paperwidth,\paperheight);
+
+			% Uni Stuttgart logo
+			\node at (0,\paperheight)[xshift=-0.055\paperheight,yshift=0.06\paperheight,anchor=north west]
+				{\includegraphics[height=0.29\paperheight]{theme/logos/unistuttgart_logo_englisch.pdf}};
+
+			% Circle with Image
+			\begin{scope}
+			\clip[xshift=0.15\paperwidth](0,0.5\paperheight) circle (0.08\paperwidth);
+			\node at (0.15\paperwidth,0.5\paperheight) {\includegraphics[height=0.16\paperwidth]{#5}};
+			\end{scope}
+
+			% Thank you
+			\node[anthrazit, xshift=0.07\paperwidth,anchor=west,inner sep = 0] at (0,0.7\paperheight) {\bf\large #1};
+
+			% Contact data
+			\node[anthrazit,xshift=0.42\paperheight,inner sep = 0, anchor = north west,align=left] at (0,0.54\paperheight) {\tiny \textbf {#2}};
+			\node[anthrazit,xshift=0.42\paperheight,inner sep = 0, anchor = north west,align=left] at (0,0.5\paperheight) {\tiny #3};
+			\node[anthrazit,xshift=0.42\paperheight,inner sep = 0, anchor = north west,align=left] at (0,0.46\paperheight) {\tiny #4};
+			\node[anthrazit,xshift=0.42\paperheight,inner sep = 0, anchor = north west,align=left] at (0,0.39\paperheight) {\tiny University of Stuttgart};
+		\end{tikzpicture}
+	}
+	\frame{}
+	}
+	\clearpage
+}
+
+% thank-you blue
+\newcommand{\thankyoublue}[5]
+{
+	{
+	\setbeamertemplate{footline}{} % No page number
+	\setbeamertemplate{background}{
+		\begin{tikzpicture}
+			% clip everything to the screen (to control alignment absolutely)
+			\clip (0,0) rectangle (\paperwidth,\paperheight);
+			\fill[shading = axis, left color = unisblue, right color = hellblau, shading angle = 135] (0,0) rectangle (\paperwidth,\paperheight);
+
+			% Uni Stuttgart logo
+			\node at (0,\paperheight)[xshift=-0.055\paperheight,yshift=0.06\paperheight,anchor=north west]
+				{\includegraphics[height=0.29\paperheight]{theme/logos/unistuttgart_logo_englisch_white.pdf}};
+
+			% Circle with Image
+			\begin{scope}
+			\clip[xshift=0.15\paperwidth](0,0.5\paperheight) circle (0.08\paperwidth);
+			\node at (0.15\paperwidth,0.5\paperheight) {\includegraphics[height=0.16\paperwidth]{#5}};
+			\end{scope}
+
+			% Thank you
+			\node[white, xshift=0.07\paperwidth,anchor=west,inner sep = 0] at (0,0.7\paperheight) {\bf\large #1};
+
+			% Contact data
+			\node[white,xshift=0.42\paperheight,inner sep = 0, anchor = north west,align=left] at (0,0.54\paperheight) {\tiny \textbf {#2}};
+
+			\node[white,xshift=0.42\paperheight,inner sep = 0, anchor = north west,align=left] at (0,0.5\paperheight) {\tiny #3};
+
+			\node[white,xshift=0.42\paperheight,inner sep = 0, anchor = north west,align=left] at (0,0.46\paperheight) {\tiny #4};
+
+			\node[white,xshift=0.42\paperheight,inner sep = 0, anchor = north west,align=left] at (0,0.39\paperheight) {\tiny University of Stuttgart};
+		\end{tikzpicture}
+	}
+	\frame{}
+	}
+	\clearpage
+}
+
+% TIKZSTYLES ----------------------------------------------------------------
+% circled numbers
+\DeclareRobustCommand*\circled[1]{\tikz[baseline=(char.base)]{\node[shape=circle,draw,inner sep=1pt] (char) {#1};}}
+% FLOW-CHART ELEMENTS
+% definition boxes with rounded corners
+\tikzstyle{defbox} = [rectangle, rounded corners, minimum width=3cm, minimum height=1cm, text centered, draw=green_dark, fill=green!5, blur shadow={shadow blur steps=5}]
+% start-stop boxes with rounded corners
+\tikzstyle{startstop} = [rectangle, rounded corners, minimum width=3cm, text centered, draw=black!50, fill=blue_lightlight, blur shadow={shadow blur steps=50,shadow blur extra rounding=0pt}]
+% tight start-stop boxes with rounded corners
+\tikzstyle{startstoptight} = [rectangle, rounded corners, minimum width=2cm, text centered, draw=black, fill=blue_lightlight]
+% input-output Parallelogram box
+\tikzstyle{io} = [trapezium, trapezium left angle=70, trapezium right angle=110, minimum width=3cm, text centered, draw=black, fill=blue!30]
+% rectangular (sharp corner) boxes for processes
+\tikzstyle{process} = [rectangle, minimum width=4cm, text centered, draw=black, fill=orange!30]
+% other-color rectangles
+\tikzstyle{processother} = [rectangle, minimum width=3cm, text centered, draw=black, fill=cyan!20]
+% diamond-shaped boxes for decision-making
+\tikzstyle{decision} = [diamond, minimum width=1cm, text centered, draw=black, fill=green!30,aspect=8]
+% thick-lined arrows with stealth-type head
+\tikzstyle{arrow} = [thick,->,>=stealth]
+\tikzstyle{biarrow} = [thick,<->,latex-latex]
+
+% EXAMPLE USAGE
+% \begin{tikzpicture}[node distance=2cm]
+%   \node (start) [startstop] {Start};
+%   \node (out1) [io, below of=pro2a] {Output};
+%   \draw [arrow] (start) -- (out1);
+% \end{tikzpicture}
+
+% FIGURE SETTINGS -----------------------------------------------------------
+% path to your figures folder
+\graphicspath{{fig/}}
+% usage:
+% \begin{wrapfigure}[lineheight]{position}[overhang]{width}
+%  \vspace{-20pt}
+%  \begin{center}
+%    \includegraphics[width=0.48\textwidth]{gull}
+%  \end{center}
+%  \vspace{-20pt}
+%  \caption{A gull}
+%  \vspace{-20pt}
+%\end{wrapfigure}
+
+%picture using the width of the text column
+% \sscFig	[ LABEL_PREFIX (optional) ]
+%			{ FILENAME (without extension) }
+%			{ CAPTION TEXT }
+%
+\renewcommand{\figurename}{} % remove Figure label of figure captions
+\newcommand{\sscFig}[3][image]%
+{%
+\begin{figure}[ht!bp]%
+	\begin{center}%
+		\includegraphics[width= \textwidth]{#2}%
+		\caption[#3]{\textit{#3}}
+		\label{#1_#2}%
+	\end{center}%
+\end{figure}%
+}%
+
+% TABLE SETTINGS -----------------------------------------------------------
+%table using the width of the text column
+% \sscTab { TABULAR DEFINITION }{ CAPTION TEXT }{ TABLE_LABEL }
+%
+% \renewcommand{\tablename}{} % remove Table label of table captions
+\newcommand{\sscTab}[3]%
+{%
+\begin{table}[htdp]%
+	\begin{center}%
+		#1%
+		\caption{#2}%
+		\label{#3}%
+	\end{center}%
+\end{table}%
+}%
+% define new table column type P for column width plus centering
+% usage: \begin{tabular}{|P{2.5cm}|P{2.5cm}|P{2.5cm}|}
+\newcolumntype{P}[1]{>{\centering\arraybackslash}p{#1}}
+% for horizontal and vertical centering use M:
+\newcolumntype{M}[1]{>{\centering\arraybackslash}m{#1}}
+
+% SPECIAL TEXT SETTINGS -----------------------------------------------------
+%typesets a 'nice' underscore for URLs
+\newcommand{\under}{$\underline{\hspace{0.5em}}$}
+% \sscURL	{ TYPESET VERSION OF URL }
+%			{ PRISTINE URL }
+%
+%typesets a URL
+%the typographically correct version appears as a footnote,
+%the anchor appears in the text, the link points to the URL
+\newcommand{\sscURL}[2]%
+{%
+	\textcolor{blue}{%
+		\href{#2}{#1}%
+	}%
+}
+
+% DEF BOXES ----------------------------------------------------------------
+% \sscDefBox{ TERM }{ DEFINITION }
+%
+%outputs a margin note and a colored box (width of the text column) containing a term and its definition
+\newlength{\sscDefBoxWidth}
+\setlength{\sscDefBoxWidth}{0.5\paperwidth}
+\addtolength{\sscDefBoxWidth}{-4mm}
+
+\newcommand{\sscDefBox}[2]
+{%
+	\setlength{\fboxrule}{1mm}%
+	\fcolorbox{orange_med}{orange_light}%
+	{%
+		\parbox{\sscDefBoxWidth}{{\bfseries\scshape#1}#2}%
+	}%
+}
+
+% \sscBigDefBox	{ TERM }{ DEFINITION }
+%
+%outputs a colored box (width of the page) containing a term and its definition
+\newlength{\sscBigDefBoxWidth}
+\setlength{\sscBigDefBoxWidth}{0.75\paperwidth}
+\addtolength{\sscBigDefBoxWidth}{-4mm}
+
+\newcommand{\sscBigDefBox}[2]
+{%
+	\begin{figure}[h!]
+	\setlength{\fboxrule}{1mm}%
+	\fcolorbox{orange_med}{orange_light}%
+	{%
+		\parbox{\sscBigDefBoxWidth}{{\bfseries\scshape#1:}\\#2}%
+	}%
+	\end{figure}
+}
+
+% places a 'todo' comment into the margin in red
+\definecolor{red}{rgb}{1,0,0}
+\newcommand{\todo}[1]{\mnote{\textcolor{red}{ToDo: #1}}}
+
+% pre-define code formats
+\definecolor{string}{rgb}{0.7,0.0,0.0}
+\definecolor{comment}{rgb}{0.13,0.54,0.13}
+\definecolor{keyword}{rgb}{0.0,0.0,1.0}
+
+% \emptydoublepage
+% Clear double page without any header or footer at end of chapters
+\newcommand{\emptydoublepage}{\clearpage\thispagestyle{empty}\cleardoublepage}
+
+% Define a list style called 'checklist'
+\definecolor{checklistgreen}{RGB}{0,110,0}
+\newcommand{\gcheck}{\textbf{\textcolor{checklistgreen}{\ding{52}}}}
+
+\newenvironment{checklist}{%
+  \begingroup
+    \setlist[itemize,1]{label=\gcheck}
+    \setlist[itemize,2]{label=\gcheck}
+    \setlist[itemize,3]{label=\gcheck}
+    \begin{itemize}
+}{%
+    \end{itemize}
+  \endgroup
+}
+
+
+% ---------------------------------------------------------------------------
+% Code blocks and more
+% ---------------------------------------------------------------------------
+
+%% Core code‑formatting
+\RequirePackage{verbatim}
+\RequirePackage{listings}
+
+% Setup lsitings (code block) styles
+\lstset{
+  backgroundcolor=\color{black},   % choose the background color; you must add \usepackage{color} or \usepackage{xcolor}; should come as last argument
+  basicstyle=\fontsize{9}{11}\selectfont\ttfamily\color{blue_med!20!white},  % the size of the fonts that are used for the code
+  breakatwhitespace=false,         % sets if automatic breaks should only happen at whitespace
+  breaklines=true,                 % sets automatic line breaking
+  captionpos=b,                    % sets the caption-position to bottom
+  commentstyle=\color{green_light},      % comment style
+  deletekeywords={...},            % if you want to delete keywords from the given language
+  escapeinside={\%*}{*)},          % if you want to add LaTeX within your code
+  extendedchars=true,              % lets you use non-ASCII characters; for 8-bits encodings only, does not work with UTF-8
+  firstnumber=1000,                % start line enumeration with line 1000
+  frame=single,                    % adds a frame around the code
+  keepspaces=true,                 % keeps spaces in text, useful for keeping indentation of code (possibly needs columns=flexible)
+  keywordstyle=\color{blue!80!white},       % keyword style
+  language=HTML,                 % the language of the code
+  morekeywords={*,...},            % if you want to add more keywords to the set
+  numbers=left,                    % where to put the line-numbers; possible values are (none, left, right)
+  numbersep=5pt,                   % how far the line-numbers are from the code
+  numberstyle=\tiny\color{red!50!white},   % the style that is used for the line-numbers
+  rulecolor=\color{black!20!white},         % if not set, the frame-color may be changed on line-breaks within not-black text (e.g. comments (green here))
+  showspaces=false,                % show spaces everywhere adding particular underscores; it overrides 'showstringspaces'
+  showstringspaces=false,          % underline spaces within strings only
+  showtabs=false,                  % show tabs within strings adding particular underscores
+  stepnumber=2,                    % the step between two line-numbers. If it's 1, each line will be numbered
+  stringstyle=\color{pink_light},    % string literal style
+  tabsize=2,                       % sets default tabsize to 2 spaces
+  title=\lstname                   % show the filename of files included with \lstinputlisting; also try caption instead of title
+}
+
+\newenvironment{fragileframe}%
+  {\begin{frame}[fragile,environment=fragileframe]}%
+  {\end{frame}}
+
+\mode<all>
