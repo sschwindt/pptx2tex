@@ -872,10 +872,14 @@ class PPTXToLatexConverter:
             lines.append("% AutoShape converted to TikZ")
             lines.append(tikz)
 
-        # Add videos (using movie15 package from style)
+        # Add videos (using movie15 package from beamertheme.sty)
         for vid in videos:
             lines.append(f"% Video: {vid}")
-            lines.append(f"\\includemovie[poster, autoplay]{{0.8\\textwidth}}{{0.6\\textwidth}}{{videos/{vid}}}")
+            lines.append("\\includemovie[")
+            lines.append("    attach=false,")
+            lines.append("    autoplay,")
+            lines.append("    text={\\includegraphics[width=\\textwidth]{videos/generic-thumbnail.jpg}}")
+            lines.append("]{\\textwidth}{\\textheight}{videos/" + vid + "}")
 
         lines.append("\\end{frame}")
         lines.append("")
