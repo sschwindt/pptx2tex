@@ -539,7 +539,7 @@ TSWLatexianTemp*
 #*Notes.bib
 
 # Local I/O directories (keep folders in repo; ignore all local contents)
-#/pptx-input/*
-#!/pptx-input/.gitkeep
-#/tex-output/*
-#!/tex-output/.gitkeep
+/pptx-input/*
+!/pptx-input/.gitkeep
+/tex-output/*
+!/tex-output/.gitkeep
