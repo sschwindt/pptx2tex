@@ -225,10 +225,6 @@ __marimo__/
 *.cb2
 .*.lb
 
-## videos
-videos/
-
-
 ## Intermediate documents:
 *.dvi
 *.xdv
@@ -541,3 +537,9 @@ TSWLatexianTemp*
 # option is specified. Footnotes are the stored in a file with suffix Notes.bib.
 # Uncomment the next line to have this generated file ignored.
 #*Notes.bib
+
+# Local I/O directories (keep folders in repo; ignore all local contents)
+/pptx-input/*
+!/pptx-input/.gitkeep
+/tex-output/*
+!/tex-output/.gitkeep

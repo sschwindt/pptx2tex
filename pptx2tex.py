@@ -13,6 +13,7 @@ If no arguments provided, processes all .pptx files in pptx-input/
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -26,7 +27,7 @@ try:
     from pptx import Presentation
     from pptx.util import Inches, Pt, Emu
     from pptx.enum.shapes import MSO_SHAPE_TYPE, MSO_SHAPE
-    from pptx.enum.dml import MSO_THEME_COLOR
+    from pptx.enum.dml import MSO_THEME_COLOR, MSO_FILL_TYPE
 except ImportError:
     print("Error: python-pptx is required. Install with: pip install python-pptx")
     sys.exit(1)
@@ -365,7 +366,7 @@ class PPTXToLatexConverter:
     def extract_image(self, shape, slide_num: int, slide_width=None, slide_height=None) -> Optional[dict]:
         """Extract image from shape, convert to high-resolution JPG (220 dpi), and save to fig directory.
 
-        Returns dict with 'filename' and 'width_ratio' (relative to slide width).
+        Returns dict with 'filename', 'width_ratio', and bounding box info for overlay detection.
         """
         try:
             if hasattr(shape, 'image'):
@@ -404,9 +405,14 @@ class PPTXToLatexConverter:
                     # Round to reasonable precision
                     width_ratio = round(width_ratio, 2)
 
+                # Store bounding box in EMU for overlay detection
                 return {
                     'filename': filename,
-                    'width_ratio': width_ratio
+                    'width_ratio': width_ratio,
+                    'left': shape.left if hasattr(shape, 'left') else 0,
+                    'top': shape.top if hasattr(shape, 'top') else 0,
+                    'width': shape.width if hasattr(shape, 'width') else 0,
+                    'height': shape.height if hasattr(shape, 'height') else 0,
                 }
         except Exception as e:
             print(f"Warning: Could not extract image: {e}")
@@ -459,6 +465,432 @@ class PPTXToLatexConverter:
         if emu is None or slide_width is None or slide_width == 0:
             return 0.8
         return min(0.95, emu / slide_width)
+
+    def shapes_overlap(self, shape, image_info: dict, tolerance: float = 0.1) -> bool:
+        """Check if a shape overlaps with an image bounding box.
+
+        Args:
+            shape: The shape to check
+            image_info: Dict with 'left', 'top', 'width', 'height' in EMU
+            tolerance: Overlap tolerance as fraction of image size (0.1 = 10%)
+
+        Returns True if the shape's center is within the image bounds (with tolerance).
+        """
+        try:
+            # Get shape bounds
+            shape_left = shape.left if hasattr(shape, 'left') else 0
+            shape_top = shape.top if hasattr(shape, 'top') else 0
+            shape_width = shape.width if hasattr(shape, 'width') else 0
+            shape_height = shape.height if hasattr(shape, 'height') else 0
+
+            # Calculate shape center
+            shape_center_x = shape_left + shape_width / 2
+            shape_center_y = shape_top + shape_height / 2
+
+            # Get image bounds with tolerance
+            img_left = image_info['left']
+            img_top = image_info['top']
+            img_width = image_info['width']
+            img_height = image_info['height']
+
+            # Expand image bounds by tolerance
+            tol_x = img_width * tolerance
+            tol_y = img_height * tolerance
+
+            # Check if shape center is within expanded image bounds
+            in_x = (img_left - tol_x) <= shape_center_x <= (img_left + img_width + tol_x)
+            in_y = (img_top - tol_y) <= shape_center_y <= (img_top + img_height + tol_y)
+
+            return in_x and in_y
+        except (AttributeError, TypeError, KeyError):
+            return False
+
+    def get_shape_fill_color(self, shape) -> Optional[tuple]:
+        """Extract fill color from shape as (r, g, b, opacity) tuple.
+
+        Returns None if no fill or transparent.
+        """
+        try:
+            fill = shape.fill
+            if fill is None or fill.type is None:
+                return None
+
+            # Check for solid fill
+            if fill.type == MSO_FILL_TYPE.SOLID:
+                fore_color = fill.fore_color
+                if fore_color and fore_color.rgb:
+                    r, g, b = fore_color.rgb[0], fore_color.rgb[1], fore_color.rgb[2]
+                    # Get transparency (0 = opaque, 1 = transparent)
+                    # In python-pptx, transparency is stored differently
+                    opacity = 1.0
+                    try:
+                        # Some shapes have transparency attribute
+                        if hasattr(fill, '_fill') and hasattr(fill._fill, 'attrib'):
+                            # Check for alpha in the fill
+                            pass
+                    except Exception:
+                        pass
+                    return (r, g, b, opacity)
+        except Exception:
+            pass
+        return None
+
+    def get_shape_font_info(self, shape) -> dict:
+        """Extract font information from a shape's text.
+
+        Returns dict with 'size_pt', 'bold', 'italic', 'color_rgb'.
+        """
+        result = {'size_pt': None, 'bold': False, 'italic': False, 'color_rgb': None}
+        try:
+            if hasattr(shape, 'text_frame') and shape.text_frame:
+                for para in shape.text_frame.paragraphs:
+                    for run in para.runs:
+                        font = run.font
+                        if font.size:
+                            result['size_pt'] = font.size.pt
+                        if font.bold:
+                            result['bold'] = True
+                        if font.italic:
+                            result['italic'] = True
+                        if font.color and font.color.rgb:
+                            result['color_rgb'] = (
+                                font.color.rgb[0],
+                                font.color.rgb[1],
+                                font.color.rgb[2]
+                            )
+                        # Use first run's properties
+                        if result['size_pt']:
+                            break
+                    if result['size_pt']:
+                        break
+        except Exception:
+            pass
+        return result
+
+    def text_shape_to_overlay_info(self, shape, image_info: dict) -> Optional[dict]:
+        """Extract overlay information from a text shape overlapping an image.
+
+        Returns dict with 'text', 'rel_x', 'rel_y', 'has_bold', 'has_italic',
+        'font_size_pt', 'font_color_rgb', 'fill_color' for rendering.
+        """
+        try:
+            # Get shape text with formatting preserved
+            shape_text = ""
+            has_bold = False
+            has_italic = False
+            font_size_pt = None
+            font_color_rgb = None
+
+            if hasattr(shape, 'text_frame') and shape.text_frame:
+                for para in shape.text_frame.paragraphs:
+                    if para.text.strip():
+                        # Check paragraph-level formatting
+                        para_font = para.font if hasattr(para, 'font') else None
+
+                        # Process runs for formatting
+                        for run in para.runs:
+                            if run.text.strip():
+                                font = run.font
+                                # Check bold - run level or paragraph level
+                                if font.bold:
+                                    has_bold = True
+                                elif para_font and para_font.bold:
+                                    has_bold = True
+                                # Check italic
+                                if font.italic:
+                                    has_italic = True
+                                elif para_font and para_font.italic:
+                                    has_italic = True
+                                # Get font size
+                                if font.size and font_size_pt is None:
+                                    font_size_pt = font.size.pt
+                                elif para_font and para_font.size and font_size_pt is None:
+                                    font_size_pt = para_font.size.pt
+                                # Get font color (handle theme colors gracefully)
+                                try:
+                                    if font.color and font.color.type is not None and font_color_rgb is None:
+                                        if font.color.rgb:
+                                            font_color_rgb = (
+                                                font.color.rgb[0],
+                                                font.color.rgb[1],
+                                                font.color.rgb[2]
+                                            )
+                                except (AttributeError, TypeError):
+                                    pass
+
+                        shape_text += self.escape_latex(para.text.strip()) + " "
+                shape_text = shape_text.strip()
+
+            if not shape_text:
+                return None
+
+            # Get shape position relative to image
+            shape_left = shape.left if hasattr(shape, 'left') else 0
+            shape_top = shape.top if hasattr(shape, 'top') else 0
+
+            img_left = image_info['left']
+            img_top = image_info['top']
+            img_width = image_info['width']
+            img_height = image_info['height']
+
+            # Calculate position as fraction of image dimensions
+            # x: 0 = left edge, 1 = right edge
+            # y: 0 = top edge, 1 = bottom edge
+            rel_x = (shape_left - img_left) / img_width if img_width else 0.5
+            rel_y = (shape_top - img_top) / img_height if img_height else 0.5
+
+            # Clamp to valid range
+            rel_x = max(0, min(1, rel_x))
+            rel_y = max(0, min(1, rel_y))
+
+            # Get fill color
+            fill_color = self.get_shape_fill_color(shape)
+
+            return {
+                'text': shape_text,
+                'rel_x': rel_x,
+                'rel_y': rel_y,
+                'has_bold': has_bold,
+                'has_italic': has_italic,
+                'font_size_pt': font_size_pt,
+                'font_color_rgb': font_color_rgb,
+                'fill_color': fill_color,
+            }
+
+        except Exception as e:
+            print(f"Warning: Could not extract overlay info: {e}")
+            return None
+
+    def render_image_with_overlays(self, img_info: dict, width_ratio: float, height_ratio: float) -> list:
+        """Render an image with its overlays in a TikZ picture.
+
+        Args:
+            img_info: Image info dict with 'filename' and optional 'overlays' list
+            width_ratio: Width as fraction of textwidth
+            height_ratio: Height as fraction of textheight
+
+        Returns list of LaTeX lines.
+        """
+        lines = []
+        filename = img_info['filename']
+        overlays = img_info.get('overlays', [])
+
+        if not overlays:
+            # No overlays - simple includegraphics
+            lines.append(f"\\begin{{center}}")
+            lines.append(f"  \\includegraphics[width={width_ratio}\\textwidth,height={height_ratio}\\textheight,keepaspectratio]{{{filename}}}")
+            lines.append(f"\\end{{center}}")
+        else:
+            # Has overlays - use TikZ with image as node and overlays positioned relative to it
+            lines.append(f"\\begin{{center}}")
+            lines.append(f"\\begin{{tikzpicture}}")
+            lines.append(f"  \\node[anchor=center, inner sep=0] (img) {{\\includegraphics[width={width_ratio}\\textwidth,height={height_ratio}\\textheight,keepaspectratio]{{{filename}}}}};")
+
+            for overlay in overlays:
+                text = overlay['text']
+                rel_x = overlay['rel_x']
+                rel_y = overlay['rel_y']
+                has_bold = overlay.get('has_bold', False)
+                has_italic = overlay.get('has_italic', False)
+                fill_color = overlay.get('fill_color')
+
+                # Build node style
+                style_parts = []
+
+                # Background fill
+                if fill_color:
+                    r, g, b, opacity = fill_color
+                    style_parts.append(f"fill={{rgb,255:red,{r};green,{g};blue,{b}}}")
+                    if opacity < 1.0:
+                        style_parts.append(f"fill opacity={opacity:.2f}")
+                else:
+                    # Default semi-transparent white background for readability
+                    style_parts.append("fill=white")
+                    style_parts.append("fill opacity=0.8")
+
+                style_parts.append("draw=none")
+                style_parts.append("rounded corners=2pt")
+                style_parts.append("inner sep=2pt")
+                style_parts.append("anchor=north west")
+
+                style_str = ", ".join(style_parts)
+
+                # Text formatting
+                font_cmds = []
+                if has_bold:
+                    font_cmds.append("\\bfseries")
+                if has_italic:
+                    font_cmds.append("\\itshape")
+                font_prefix = " ".join(font_cmds) + " " if font_cmds else ""
+
+                # Position relative to image node using TikZ calc library
+                # rel_x: 0 = left edge, 1 = right edge
+                # rel_y: 0 = top edge, 1 = bottom edge
+                # Use two-step interpolation:
+                # 1. Interpolate horizontally from north west to north east
+                # 2. Then interpolate vertically from that point down to south
+                # The syntax $(A)!factor!(B)$ gives a point factor of the way from A to B
+                lines.append(f"  \\node[{style_str}] at ($($(img.north west)!{rel_x:.3f}!(img.north east)$)!{rel_y:.3f}!($(img.south west)!{rel_x:.3f}!(img.south east)$)$) {{{font_prefix}{text}}};")
+
+            lines.append(f"\\end{{tikzpicture}}")
+            lines.append(f"\\end{{center}}")
+
+        return lines
+
+    def text_shape_to_tikz_overlay(self, shape, image_info: dict, slide_width, slide_height) -> Optional[str]:
+        """Convert a text shape overlapping an image to a TikZ overlay node.
+
+        Positions the text relative to the image and preserves styling.
+        NOTE: This method is deprecated - use text_shape_to_overlay_info instead.
+        """
+        try:
+            # Get shape text with formatting preserved
+            shape_text = ""
+            has_bold = False
+            has_italic = False
+            font_size_pt = None
+            font_color_rgb = None
+
+            if hasattr(shape, 'text_frame') and shape.text_frame:
+                for para in shape.text_frame.paragraphs:
+                    if para.text.strip():
+                        # Check paragraph-level formatting
+                        para_font = para.font if hasattr(para, 'font') else None
+
+                        # Process runs for formatting
+                        for run in para.runs:
+                            if run.text.strip():
+                                font = run.font
+                                # Check bold - run level or paragraph level
+                                if font.bold:
+                                    has_bold = True
+                                elif para_font and para_font.bold:
+                                    has_bold = True
+                                # Check italic
+                                if font.italic:
+                                    has_italic = True
+                                elif para_font and para_font.italic:
+                                    has_italic = True
+                                # Get font size
+                                if font.size and font_size_pt is None:
+                                    font_size_pt = font.size.pt
+                                elif para_font and para_font.size and font_size_pt is None:
+                                    font_size_pt = para_font.size.pt
+                                # Get font color (handle theme colors gracefully)
+                                try:
+                                    if font.color and font.color.type is not None and font_color_rgb is None:
+                                        if font.color.rgb:
+                                            font_color_rgb = (
+                                                font.color.rgb[0],
+                                                font.color.rgb[1],
+                                                font.color.rgb[2]
+                                            )
+                                except (AttributeError, TypeError):
+                                    pass
+
+                        shape_text += self.escape_latex(para.text.strip()) + " "
+                shape_text = shape_text.strip()
+
+            if not shape_text:
+                return None
+
+            # Get shape position relative to image
+            shape_left = shape.left if hasattr(shape, 'left') else 0
+            shape_top = shape.top if hasattr(shape, 'top') else 0
+            shape_width = shape.width if hasattr(shape, 'width') else 0
+
+            img_left = image_info['left']
+            img_top = image_info['top']
+            img_width = image_info['width']
+            img_height = image_info['height']
+
+            # Calculate position as fraction of image dimensions
+            # x: 0 = left edge, 1 = right edge
+            # y: 0 = top edge, 1 = bottom edge
+            rel_x = (shape_left - img_left) / img_width if img_width else 0.5
+            rel_y = (shape_top - img_top) / img_height if img_height else 0.5
+
+            # Clamp to valid range
+            rel_x = max(0, min(1, rel_x))
+            rel_y = max(0, min(1, rel_y))
+
+            # Convert to TikZ positioning (relative to image center)
+            # Image width in textwidth units
+            img_width_ratio = image_info.get('width_ratio', 0.8)
+
+            # Calculate offset from image center in textwidth units
+            x_offset = (rel_x - 0.5) * img_width_ratio
+            # Y offset: positive = up in TikZ, but we want to go down from top
+            # Estimate image height based on aspect ratio (assume ~0.6 of width for typical images)
+            img_height_ratio = img_width_ratio * 0.6  # Approximation
+            y_offset = (0.5 - rel_y) * img_height_ratio * 10  # Scale for cm
+
+            # Get shape fill color
+            fill_color = self.get_shape_fill_color(shape)
+
+            # Build TikZ style
+            style_parts = []
+
+            # Background fill
+            if fill_color:
+                r, g, b, opacity = fill_color
+                # Define color inline
+                style_parts.append(f"fill={{rgb,255:red,{r};green,{g};blue,{b}}}")
+                if opacity < 1.0:
+                    style_parts.append(f"fill opacity={opacity:.2f}")
+            else:
+                # Default semi-transparent white background for readability
+                style_parts.append("fill=white")
+                style_parts.append("fill opacity=0.8")
+
+            # Shape outline
+            style_parts.append("draw=none")
+            style_parts.append("rounded corners=2pt")
+
+            # Inner padding
+            style_parts.append("inner sep=2pt")
+
+            # Text formatting commands
+            font_cmds = []
+            if has_bold:
+                font_cmds.append("\\bfseries")
+            if has_italic:
+                font_cmds.append("\\itshape")
+            if font_size_pt:
+                if font_size_pt < 8:
+                    font_cmds.append("\\tiny")
+                elif font_size_pt < 10:
+                    font_cmds.append("\\scriptsize")
+                elif font_size_pt < 11:
+                    font_cmds.append("\\footnotesize")
+                elif font_size_pt < 12:
+                    font_cmds.append("\\small")
+                elif font_size_pt > 18:
+                    font_cmds.append("\\Large")
+                elif font_size_pt > 14:
+                    font_cmds.append("\\large")
+
+            font_prefix = " ".join(font_cmds) + " " if font_cmds else ""
+
+            # Text color
+            text_color_cmd = ""
+            if font_color_rgb:
+                r, g, b = font_color_rgb
+                text_color_cmd = f"\\color[RGB]{{{r},{g},{b}}}"
+
+            style_str = ", ".join(style_parts)
+
+            # Build TikZ code - position relative to the previous image
+            # Using scope with shift based on calculated position
+            tikz_code = f"""\\begin{{tikzpicture}}[overlay, remember picture]
+  \\node[{style_str}, anchor=north west] at ([xshift={x_offset:.3f}\\textwidth, yshift={y_offset:.2f}cm]current page.center) {{{text_color_cmd}{font_prefix}{shape_text}}};
+\\end{{tikzpicture}}"""
+
+            return tikz_code
+
+        except Exception as e:
+            print(f"Warning: Could not convert text shape to TikZ overlay: {e}")
+            return None
 
     def extract_all_images_from_shape(self, shape, slide_num: int, slide_width=None, slide_height=None, depth=0) -> list:
         """Recursively extract images from any shape type.
@@ -610,10 +1042,215 @@ class PPTXToLatexConverter:
             print(f"Warning: Could not convert shape to TikZ: {e}")
             return None
 
+    def get_shape_line_color(self, shape) -> Optional[tuple]:
+        """Extract line/border color from shape as (r, g, b) tuple.
+
+        Returns None if no line or transparent.
+        """
+        try:
+            line = shape.line
+            if line is None:
+                return None
+
+            # Check if line has a fill (visible border)
+            if line.fill and line.fill.type is not None:
+                if line.fill.type == MSO_FILL_TYPE.SOLID:
+                    fore_color = line.fill.fore_color
+                    if fore_color and fore_color.rgb:
+                        return (fore_color.rgb[0], fore_color.rgb[1], fore_color.rgb[2])
+
+            # Alternative: check line color directly
+            if hasattr(line, 'color') and line.color and line.color.rgb:
+                return (line.color.rgb[0], line.color.rgb[1], line.color.rgb[2])
+
+        except Exception:
+            pass
+        return None
+
+    def classify_shape_type(self, shape) -> dict:
+        """Classify a shape into a category for TikZ rendering.
+
+        Returns dict with 'category' (rectangle, rounded_rect, oval, callout, arrow, other),
+        'has_border', 'border_color', 'tikz_shape_style'.
+        """
+        result = {
+            'category': 'rectangle',
+            'has_border': True,
+            'border_color': None,
+            'tikz_shape_style': ''
+        }
+
+        try:
+            if shape.shape_type != MSO_SHAPE_TYPE.AUTO_SHAPE:
+                result['category'] = 'text'
+                result['has_border'] = False
+                return result
+
+            auto_type = shape.auto_shape_type
+            if auto_type is None:
+                return result
+
+            type_name = str(auto_type).upper()
+
+            # Classify based on shape type name
+            if 'OVAL' in type_name or 'ELLIPSE' in type_name or 'CIRCLE' in type_name:
+                result['category'] = 'oval'
+                result['tikz_shape_style'] = 'ellipse'
+            elif 'ROUNDED' in type_name:
+                result['category'] = 'rounded_rect'
+                result['tikz_shape_style'] = 'rounded corners=4pt'
+            elif 'CALLOUT' in type_name:
+                result['category'] = 'callout'
+                result['tikz_shape_style'] = 'rounded corners, drop shadow'
+            elif 'ARROW' in type_name:
+                result['category'] = 'arrow'
+                result['tikz_shape_style'] = '->, thick'
+            elif 'DIAMOND' in type_name:
+                result['category'] = 'diamond'
+                result['tikz_shape_style'] = 'diamond'
+            elif 'TRIANGLE' in type_name:
+                result['category'] = 'triangle'
+                result['tikz_shape_style'] = 'regular polygon, regular polygon sides=3'
+            elif 'PENTAGON' in type_name:
+                result['category'] = 'pentagon'
+                result['tikz_shape_style'] = 'regular polygon, regular polygon sides=5'
+            elif 'HEXAGON' in type_name:
+                result['category'] = 'hexagon'
+                result['tikz_shape_style'] = 'regular polygon, regular polygon sides=6'
+            elif 'STAR' in type_name:
+                result['category'] = 'star'
+                result['tikz_shape_style'] = 'star'
+            elif 'CLOUD' in type_name:
+                result['category'] = 'cloud'
+                result['tikz_shape_style'] = 'cloud, cloud puffs=10'
+            else:
+                # Default to rectangle
+                result['category'] = 'rectangle'
+
+            # Get border color
+            result['border_color'] = self.get_shape_line_color(shape)
+
+            # Check if shape has visible border
+            try:
+                if hasattr(shape, 'line') and shape.line:
+                    # Line width of 0 or no fill means no border
+                    if shape.line.width and shape.line.width > 0:
+                        result['has_border'] = True
+                    else:
+                        result['has_border'] = False
+            except Exception:
+                pass
+
+        except Exception:
+            pass
+
+        return result
+
+    def extract_positioned_element(self, shape, slide_width, slide_height) -> Optional[dict]:
+        """Extract a positioned element (text shape or AutoShape) with its position and styling.
+
+        Returns dict with 'type', 'text', 'rel_x', 'rel_y', 'rel_width', 'rel_height',
+        'has_bold', 'has_italic', 'font_size_pt', 'font_color_rgb', 'fill_color',
+        'auto_shape_type', 'shape_category', 'border_color', 'tikz_shape_style'.
+        """
+        try:
+            # Get shape position relative to slide
+            shape_left = shape.left if hasattr(shape, 'left') else 0
+            shape_top = shape.top if hasattr(shape, 'top') else 0
+            shape_width = shape.width if hasattr(shape, 'width') else 0
+            shape_height = shape.height if hasattr(shape, 'height') else 0
+
+            # Calculate relative positions (0-1 range)
+            rel_x = shape_left / slide_width if slide_width else 0.5
+            rel_y = shape_top / slide_height if slide_height else 0.5
+            rel_width = shape_width / slide_width if slide_width else 0.1
+            rel_height = shape_height / slide_height if slide_height else 0.1
+
+            # Classify the shape type
+            shape_info = self.classify_shape_type(shape)
+
+            # Extract text and formatting
+            shape_text = ""
+            has_bold = False
+            has_italic = False
+            font_size_pt = None
+            font_color_rgb = None
+
+            if hasattr(shape, 'text_frame') and shape.text_frame:
+                for para in shape.text_frame.paragraphs:
+                    if para.text.strip():
+                        para_font = para.font if hasattr(para, 'font') else None
+                        for run in para.runs:
+                            if run.text.strip():
+                                font = run.font
+                                if font.bold:
+                                    has_bold = True
+                                elif para_font and para_font.bold:
+                                    has_bold = True
+                                if font.italic:
+                                    has_italic = True
+                                elif para_font and para_font.italic:
+                                    has_italic = True
+                                if font.size and font_size_pt is None:
+                                    font_size_pt = font.size.pt
+                                elif para_font and para_font.size and font_size_pt is None:
+                                    font_size_pt = para_font.size.pt
+                                try:
+                                    if font.color and font.color.type is not None and font_color_rgb is None:
+                                        if font.color.rgb:
+                                            font_color_rgb = (font.color.rgb[0], font.color.rgb[1], font.color.rgb[2])
+                                except (AttributeError, TypeError):
+                                    pass
+                        shape_text += self.escape_latex(para.text.strip()) + " "
+                shape_text = shape_text.strip()
+
+            if not shape_text:
+                return None
+
+            # Get fill color with better extraction
+            fill_color = self.get_shape_fill_color(shape)
+
+            # Get AutoShape type if applicable
+            auto_shape_type = None
+            try:
+                if shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE:
+                    auto_shape_type = str(shape.auto_shape_type) if shape.auto_shape_type else None
+            except Exception:
+                pass
+
+            return {
+                'type': 'text' if auto_shape_type is None else 'autoshape',
+                'text': shape_text,
+                'rel_x': rel_x,
+                'rel_y': rel_y,
+                'rel_width': rel_width,
+                'rel_height': rel_height,
+                'has_bold': has_bold,
+                'has_italic': has_italic,
+                'font_size_pt': font_size_pt,
+                'font_color_rgb': font_color_rgb,
+                'fill_color': fill_color,
+                'shape_category': shape_info['category'],
+                'border_color': shape_info['border_color'],
+                'has_border': shape_info['has_border'],
+                'tikz_shape_style': shape_info['tikz_shape_style'],
+                'auto_shape_type': auto_shape_type,
+            }
+
+        except Exception as e:
+            print(f"Warning: Could not extract positioned element: {e}")
+            return None
+
     def get_all_shape_content(self, slide, slide_num: int, slide_width, slide_height) -> dict:
         """Extract all content from a slide: title, text items, images, shapes.
 
-        Returns dict with 'title', 'subtitle', 'content_items', 'images', 'videos', 'tikz_shapes'.
+        Uses a comprehensive approach to detect:
+        - Images with their bounding boxes
+        - Positioned elements (text shapes and AutoShapes that should maintain position)
+        - Body placeholder content (bullet points)
+
+        Returns dict with 'title', 'subtitle', 'content_items', 'images', 'videos',
+        'positioned_elements', 'needs_unified_tikz'.
         """
         result = {
             'title': '',
@@ -621,31 +1258,31 @@ class PPTXToLatexConverter:
             'content_items': [],
             'images': [],
             'videos': [],
-            'tikz_shapes': []
+            'positioned_elements': []  # New: stores all positioned shapes
         }
 
         # Track if we've found title/subtitle
         title_found = False
         subtitle_found = False
 
-        for shape in slide.shapes:
+        # Collect shapes for two-pass processing
+        all_shapes = list(slide.shapes)
+        text_shapes_to_process = []  # Will be processed in second pass
+
+        # === PASS 1: Extract all images first (needed for overlap detection) ===
+        for shape in all_shapes:
             try:
                 shape_type = shape.shape_type
-                shape_processed = False
 
-                # Debug: Print shape info for troubleshooting
-                # print(f"  Shape: type={shape_type}, has_image={hasattr(shape, 'image')}, text='{shape.text[:30] if hasattr(shape, 'text') and shape.text else ''}'")
-
-                # Handle grouped shapes - extract images and text recursively
+                # Handle grouped shapes - extract images recursively
                 if shape_type == MSO_SHAPE_TYPE.GROUP:
                     result['images'].extend(
                         self.extract_all_images_from_shape(shape, slide_num, slide_width, slide_height)
                     )
-                    # Also check for text in grouped shapes
+                    # Queue grouped text shapes for second pass
                     for child_shape in shape.shapes:
                         if hasattr(child_shape, 'text_frame') and child_shape.text:
-                            paragraphs = self.process_text_frame(child_shape.text_frame)
-                            result['content_items'].extend(paragraphs)
+                            text_shapes_to_process.append(child_shape)
                     continue
 
                 # Check for image in ANY shape that has an 'image' attribute
@@ -653,14 +1290,14 @@ class PPTXToLatexConverter:
                     img_info = self.extract_image(shape, slide_num, slide_width, slide_height)
                     if img_info:
                         result['images'].append(img_info)
-                        shape_processed = True
+                    if shape_type == MSO_SHAPE_TYPE.PICTURE:
+                        continue
 
                 # Handle pictures specifically
                 if shape_type == MSO_SHAPE_TYPE.PICTURE:
-                    if not shape_processed:
-                        img_info = self.extract_image(shape, slide_num, slide_width, slide_height)
-                        if img_info:
-                            result['images'].append(img_info)
+                    img_info = self.extract_image(shape, slide_num, slide_width, slide_height)
+                    if img_info:
+                        result['images'].append(img_info)
                     continue
 
                 # Handle videos/media
@@ -670,21 +1307,23 @@ class PPTXToLatexConverter:
                         result['videos'].append(vid_file)
                     continue
 
-                # Handle AutoShapes (callouts, etc.) - convert to TikZ
-                # But don't skip - the text content should also be processed
-                if shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE:
-                    tikz = self.shape_to_tikz(shape, slide_width, slide_height)
-                    if tikz:
-                        result['tikz_shapes'].append(tikz)
-                    # Don't continue - fall through to process text content too
-                    # But skip adding to content_items since TikZ already has the text
-                    if tikz:
-                        continue
+                # Queue other shapes for second pass
+                text_shapes_to_process.append(shape)
 
-                # Handle text frames (including remaining AutoShapes without TikZ)
+            except Exception as e:
+                print(f"Warning: Could not process shape in pass 1: {e}")
+                continue
+
+        # === PASS 2: Process text shapes ===
+        for shape in text_shapes_to_process:
+            try:
+                shape_type = shape.shape_type
+
+                # Handle text frames
                 if hasattr(shape, 'text_frame') and shape.text and shape.text.strip():
-                    # Check if this is a placeholder
+                    # Check if this is a placeholder (title, subtitle, body)
                     is_placeholder_handled = False
+                    is_body_placeholder = False
                     try:
                         if shape.is_placeholder:
                             ph_type = shape.placeholder_format.type
@@ -693,27 +1332,70 @@ class PPTXToLatexConverter:
                                 result['title'] = self.clean_text(shape.text)
                                 title_found = True
                                 is_placeholder_handled = True
-                            # Subtitle placeholder (type 2) - this is often the frame subtitle
+                            # Subtitle placeholder (type 2)
                             elif ph_type == 2 and not subtitle_found:
                                 result['subtitle'] = self.clean_text(shape.text)
                                 subtitle_found = True
                                 is_placeholder_handled = True
-                            # Body/Content placeholder - process as content
+                            # Body/Content placeholder - process as content (bullet points)
                             elif ph_type in [6, 7]:  # BODY, OBJECT
                                 paragraphs = self.process_text_frame(shape.text_frame)
                                 result['content_items'].extend(paragraphs)
                                 is_placeholder_handled = True
+                                is_body_placeholder = True
                     except (ValueError, AttributeError):
                         pass
 
-                    # Process as regular content if not a special placeholder
+                    # Skip source/citation text (only if it's a short citation, not body content)
                     if not is_placeholder_handled:
-                        paragraphs = self.process_text_frame(shape.text_frame)
-                        result['content_items'].extend(paragraphs)
+                        shape_text = shape.text.strip()
+                        shape_text_lower = shape_text.lower()
+                        # Only treat as source if it's short (single line citation) and starts with source pattern
+                        is_short_text = len(shape_text) < 200 and '\n' not in shape_text
+                        starts_with_source = any(shape_text_lower.startswith(pattern) for pattern in [
+                            'quelle:', 'source:', 'bildquelle:', 'datenquelle:',
+                            'videoquelle:', 'grafikquelle:'
+                        ])
+                        if is_short_text and starts_with_source:
+                            # Extract source text for later use
+                            result.setdefault('sources', []).append(shape_text)
+                            is_placeholder_handled = True
+
+                    # Non-placeholder text shapes: determine if they should be positioned elements
+                    # or content items based on their characteristics
+                    if not is_placeholder_handled and not is_body_placeholder:
+                        shape_text = shape.text.strip()
+                        # Heuristic: if text has multiple paragraphs/lines or is very long,
+                        # it's likely body content, not a positioned label
+                        num_paras = len([p for p in shape.text_frame.paragraphs if p.text.strip()])
+                        is_substantial_content = num_paras > 2 or len(shape_text) > 300
+
+                        if is_substantial_content:
+                            # Treat as body content (bullet points)
+                            paragraphs = self.process_text_frame(shape.text_frame)
+                            result['content_items'].extend(paragraphs)
+                        else:
+                            # Treat as positioned element
+                            elem = self.extract_positioned_element(shape, slide_width, slide_height)
+                            if elem:
+                                result['positioned_elements'].append(elem)
+                        continue
+
+                # Handle AutoShapes (callouts, etc.) - always positioned elements
+                elif shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE:
+                    elem = self.extract_positioned_element(shape, slide_width, slide_height)
+                    if elem:
+                        result['positioned_elements'].append(elem)
 
             except Exception as e:
-                print(f"Warning: Could not process shape: {e}")
+                print(f"Warning: Could not process shape in pass 2: {e}")
                 continue
+
+        # Determine if we need unified TikZ rendering
+        # Criteria: multiple images OR (images + positioned elements)
+        num_images = len(result['images'])
+        num_positioned = len(result['positioned_elements'])
+        result['needs_unified_tikz'] = (num_images >= 2) or (num_images >= 1 and num_positioned >= 1)
 
         return result
 
@@ -796,11 +1478,470 @@ class PPTXToLatexConverter:
 
         return info
 
-    def slide_to_latex(self, slide, slide_num: int, slide_width=None, slide_height=None) -> str:
-        """Convert a single slide to LaTeX frame using comprehensive shape extraction."""
+    def extract_sources_from_content(self, content_items: list) -> tuple:
+        """Extract source references from content items.
+
+        Returns tuple of (filtered_content_items, sources_list).
+        Sources are identified by patterns like "Bildquelle:", "Quelle:", URLs, etc.
+        """
+        filtered_items = []
+        sources = []
+
+        source_patterns = [
+            r'(?:Bild|Daten|Video|Grafik)?[Qq]uelle:?\s*(.+)',
+            r'Source:?\s*(.+)',
+        ]
+
+        for item in content_items:
+            raw_text = item.get('raw_text', item.get('text', ''))
+            is_source = False
+
+            # Check for source patterns
+            for pattern in source_patterns:
+                match = re.match(pattern, raw_text.strip(), re.IGNORECASE)
+                if match:
+                    source_text = match.group(1).strip()
+                    if source_text:
+                        sources.append(source_text)
+                    is_source = True
+                    break
+
+            # Check for standalone URLs that look like sources
+            if not is_source:
+                url_match = re.match(r'^https?://\S+$', raw_text.strip())
+                if url_match:
+                    sources.append(raw_text.strip())
+                    is_source = True
+
+            if not is_source:
+                filtered_items.append(item)
+
+        return filtered_items, sources
+
+    def images_overlap(self, img1: dict, img2: dict, threshold: float = 0.3) -> bool:
+        """Check if two images overlap significantly.
+
+        Args:
+            img1, img2: Image info dicts with 'left', 'top', 'width', 'height' in EMU
+            threshold: Minimum overlap ratio to consider as overlapping (0.3 = 30%)
+
+        Returns True if the images overlap by at least the threshold amount.
+        """
+        try:
+            # Get bounding boxes
+            l1, t1 = img1.get('left', 0), img1.get('top', 0)
+            w1, h1 = img1.get('width', 0), img1.get('height', 0)
+            l2, t2 = img2.get('left', 0), img2.get('top', 0)
+            w2, h2 = img2.get('width', 0), img2.get('height', 0)
+
+            # Calculate overlap region
+            overlap_left = max(l1, l2)
+            overlap_top = max(t1, t2)
+            overlap_right = min(l1 + w1, l2 + w2)
+            overlap_bottom = min(t1 + h1, t2 + h2)
+
+            # Check if there's actual overlap
+            if overlap_right <= overlap_left or overlap_bottom <= overlap_top:
+                return False
+
+            # Calculate overlap area
+            overlap_area = (overlap_right - overlap_left) * (overlap_bottom - overlap_top)
+
+            # Calculate areas of both images
+            area1 = w1 * h1
+            area2 = w2 * h2
+            smaller_area = min(area1, area2) if area1 > 0 and area2 > 0 else 1
+
+            # Check if overlap is significant relative to smaller image
+            overlap_ratio = overlap_area / smaller_area
+            return overlap_ratio >= threshold
+
+        except (TypeError, KeyError):
+            return False
+
+    def group_overlapping_images(self, images: list) -> list:
+        """Group overlapping images together for animation.
+
+        Returns list of image groups. Each group is a list of images that overlap.
+        Non-overlapping images are in their own single-element groups.
+        Images within a group are ordered by their z-order (first = back, last = front).
+        """
+        if not images:
+            return []
+
+        # Track which images have been assigned to groups
+        assigned = [False] * len(images)
+        groups = []
+
+        for i, img in enumerate(images):
+            if assigned[i]:
+                continue
+
+            # Start a new group with this image
+            group = [img]
+            assigned[i] = True
+
+            # Find all images that overlap with any image in the group
+            changed = True
+            while changed:
+                changed = False
+                for j, other_img in enumerate(images):
+                    if assigned[j]:
+                        continue
+                    # Check if other_img overlaps with any image in the group
+                    for group_img in group:
+                        if self.images_overlap(group_img, other_img):
+                            group.append(other_img)
+                            assigned[j] = True
+                            changed = True
+                            break
+
+            groups.append(group)
+
+        return groups
+
+    def estimate_content_density(self, content_items: list, images: list, videos: list,
+                                   positioned_elements: list) -> dict:
+        """Estimate content density to determine if adjustments are needed.
+
+        Returns dict with 'item_count', 'image_count', 'is_text_heavy', 'is_image_heavy',
+        'has_overlapping_images', 'image_groups', 'recommended_font_size', 'recommended_image_height'.
+        """
+        item_count = len(content_items)
+        image_count = len(images)
+        positioned_count = len(positioned_elements)
+
+        # Group overlapping images
+        image_groups = self.group_overlapping_images(images)
+        has_overlapping_images = any(len(group) > 1 for group in image_groups)
+
+        # Count distinct image positions (groups, not individual overlapping images)
+        distinct_image_positions = len(image_groups)
+
+        # Text-heavy: many items with few images
+        is_text_heavy = item_count > 12 and image_count <= 1
+
+        # Image-heavy: multiple non-overlapping images that need to share vertical space
+        # Overlapping images don't count as image-heavy since they stack
+        is_image_heavy = distinct_image_positions >= 2 and not has_overlapping_images
+
+        # Determine recommended font size for text-heavy slides
+        # Use scriptsize as the smallest to maintain readability
+        recommended_font_size = None
+        recommended_itemsep = None
+        if is_text_heavy:
+            if item_count > 18:
+                recommended_font_size = "\\scriptsize"
+                recommended_itemsep = "0pt"
+            elif item_count > 14:
+                recommended_font_size = "\\footnotesize"
+                recommended_itemsep = "1pt"
+            elif item_count > 10:
+                recommended_font_size = "\\small"
+                recommended_itemsep = "2pt"
+
+        # Determine recommended image height for multi-image slides (non-overlapping only)
+        recommended_image_height = None
+        if is_image_heavy:
+            available_height = 0.70  # fraction of textheight
+            # Subtract space for text items if present
+            if item_count > 0:
+                available_height -= min(0.2, item_count * 0.02)
+            # Divide among distinct image positions
+            per_image_height = available_height / distinct_image_positions
+            # Ensure minimum reasonable size
+            per_image_height = max(0.15, min(0.5, per_image_height))
+            recommended_image_height = per_image_height
+
+        return {
+            'item_count': item_count,
+            'image_count': image_count,
+            'is_text_heavy': is_text_heavy,
+            'is_image_heavy': is_image_heavy,
+            'has_overlapping_images': has_overlapping_images,
+            'image_groups': image_groups,
+            'recommended_font_size': recommended_font_size,
+            'recommended_itemsep': recommended_itemsep,
+            'recommended_image_height': recommended_image_height,
+        }
+
+    def render_unified_tikz(self, images: list, positioned_elements: list, max_height: float = 0.75) -> list:
+        """Render all images and positioned elements in a unified TikZ picture.
+
+        All elements are positioned relative to each other using their original
+        slide coordinates, maintaining correct relative positions when scaled.
+        Overlapping images are rendered with animation (click-to-reveal).
+
+        Args:
+            images: List of image info dicts with bounding boxes
+            positioned_elements: List of positioned element dicts
+            max_height: Maximum height as fraction of textheight
+
+        Returns list of LaTeX lines.
+        """
         lines = []
 
-        # Use the new comprehensive content extraction
+        if not images and not positioned_elements:
+            return lines
+
+        # Group overlapping images for animation
+        image_groups = self.group_overlapping_images(images)
+        has_overlapping = any(len(g) > 1 for g in image_groups)
+
+        # Calculate the bounding box of all elements to determine scale
+        all_elements = []
+
+        for img in images:
+            all_elements.append({
+                'type': 'image',
+                'left': img.get('left', 0),
+                'top': img.get('top', 0),
+                'width': img.get('width', 0),
+                'height': img.get('height', 0),
+                'data': img
+            })
+
+        if not all_elements and not positioned_elements:
+            return lines
+
+        # Find bounding box of all images (in EMU)
+        if all_elements:
+            min_left = min(e['left'] for e in all_elements)
+            min_top = min(e['top'] for e in all_elements)
+            max_right = max(e['left'] + e['width'] for e in all_elements)
+            max_bottom = max(e['top'] + e['height'] for e in all_elements)
+        else:
+            min_left = min_top = 0
+            max_right = max_bottom = 1
+
+        total_width = max_right - min_left if max_right > min_left else 1
+        total_height = max_bottom - min_top if max_bottom > min_top else 1
+
+        lines.append("\\begin{center}")
+        lines.append("\\begin{tikzpicture}")
+
+        # Determine the TikZ canvas size based on content
+        canvas_width = 0.9  # fraction of textwidth
+        canvas_height = max_height  # fraction of textheight
+
+        # Render images - handle overlapping groups with animation
+        img_node_idx = 0
+        for group in image_groups:
+            if len(group) == 1:
+                # Single image - render normally
+                img = group[0]
+                elem = next(e for e in all_elements if e['data'] is img)
+                filename = img['filename']
+
+                rel_x = (elem['left'] - min_left) / total_width if total_width else 0.5
+                rel_y = (elem['top'] - min_top) / total_height if total_height else 0.5
+                rel_w = elem['width'] / total_width if total_width else 1
+                rel_h = elem['height'] / total_height if total_height else 1
+
+                x_pos = rel_x * canvas_width
+                y_pos = (1 - rel_y - rel_h) * canvas_height
+                img_width = rel_w * canvas_width
+                img_height = rel_h * canvas_height
+
+                lines.append(f"  \\node[anchor=south west, inner sep=0] (img{img_node_idx}) at ({x_pos:.3f}\\textwidth, {y_pos:.3f}\\textheight) {{\\includegraphics[width={img_width:.3f}\\textwidth,height={img_height:.3f}\\textheight,keepaspectratio]{{{filename}}}}};")
+
+                # Render overlays for this image
+                for overlay in img.get('overlays', []):
+                    self._render_overlay_node(lines, overlay, f"img{img_node_idx}")
+
+                img_node_idx += 1
+            else:
+                # Multiple overlapping images - use animation
+                # Find the combined bounding box for this group
+                group_elems = [next(e for e in all_elements if e['data'] is img) for img in group]
+                group_left = min(e['left'] for e in group_elems)
+                group_top = min(e['top'] for e in group_elems)
+                group_right = max(e['left'] + e['width'] for e in group_elems)
+                group_bottom = max(e['top'] + e['height'] for e in group_elems)
+
+                # Position for the group (use the first/background image position)
+                rel_x = (group_left - min_left) / total_width if total_width else 0.5
+                rel_y = (group_top - min_top) / total_height if total_height else 0.5
+                group_w = (group_right - group_left) / total_width if total_width else 1
+                group_h = (group_bottom - group_top) / total_height if total_height else 1
+
+                x_pos = rel_x * canvas_width
+                y_pos = (1 - rel_y - group_h) * canvas_height
+                img_width = group_w * canvas_width
+                img_height = group_h * canvas_height
+
+                base_node = f"img{img_node_idx}"
+
+                for anim_idx, img in enumerate(group):
+                    filename = img['filename']
+                    width_ratio = img.get('width_ratio', 0.8)
+
+                    if anim_idx == 0:
+                        # First image (background) - always visible
+                        lines.append(f"  \\node[anchor=south west, inner sep=0] ({base_node}) at ({x_pos:.3f}\\textwidth, {y_pos:.3f}\\textheight) {{\\includegraphics[width={img_width:.3f}\\textwidth,height={img_height:.3f}\\textheight,keepaspectratio]{{{filename}}}}};")
+                    else:
+                        # Subsequent images - use onslide for animation
+                        overlay_num = anim_idx + 1
+                        lines.append(f"  \\onslide<{overlay_num}->{{\\node[anchor=south west, inner sep=0] at ({base_node}.south west) {{\\includegraphics[width={img_width:.3f}\\textwidth,height={img_height:.3f}\\textheight,keepaspectratio]{{{filename}}}}};}}")
+
+                    # Render overlays for this image
+                    for overlay in img.get('overlays', []):
+                        if anim_idx == 0:
+                            self._render_overlay_node(lines, overlay, base_node)
+                        else:
+                            # Overlays on animated images also need onslide
+                            overlay_num = anim_idx + 1
+                            # For now, skip overlays on non-base animated images
+                            pass
+
+                img_node_idx += 1
+
+        # Render positioned elements (text shapes, AutoShapes)
+        for elem in positioned_elements:
+            self._render_positioned_element(lines, elem, canvas_width, canvas_height)
+
+        lines.append("\\end{tikzpicture}")
+        lines.append("\\end{center}")
+
+        return lines
+
+    def _render_overlay_node(self, lines: list, overlay: dict, parent_node: str):
+        """Render an overlay as a TikZ node positioned relative to parent."""
+        text = overlay['text']
+        rel_x = overlay['rel_x']
+        rel_y = overlay['rel_y']
+        has_bold = overlay.get('has_bold', False)
+        has_italic = overlay.get('has_italic', False)
+        fill_color = overlay.get('fill_color')
+
+        # Build node style
+        style_parts = []
+        if fill_color:
+            r, g, b, opacity = fill_color
+            style_parts.append(f"fill={{rgb,255:red,{r};green,{g};blue,{b}}}")
+            if opacity < 1.0:
+                style_parts.append(f"fill opacity={opacity:.2f}")
+        else:
+            style_parts.append("fill=white")
+            style_parts.append("fill opacity=0.8")
+
+        style_parts.extend(["draw=none", "rounded corners=2pt", "inner sep=2pt", "anchor=north west"])
+        style_str = ", ".join(style_parts)
+
+        # Text formatting
+        font_cmds = []
+        if has_bold:
+            font_cmds.append("\\bfseries")
+        if has_italic:
+            font_cmds.append("\\itshape")
+        font_prefix = " ".join(font_cmds) + " " if font_cmds else ""
+
+        # Position relative to parent node
+        lines.append(f"  \\node[{style_str}] at ($({parent_node}.north west)!{rel_x:.3f}!({parent_node}.north east)!{rel_y:.3f}!($({parent_node}.south west)!{rel_x:.3f}!({parent_node}.south east)$)$) {{{font_prefix}{text}}};")
+
+    def _render_positioned_element(self, lines: list, elem: dict, canvas_width: float, canvas_height: float):
+        """Render a positioned element (text shape or AutoShape) as a TikZ node."""
+        text = elem['text']
+        rel_x = elem['rel_x']
+        rel_y = elem['rel_y']
+        rel_width = elem.get('rel_width', 0.1)
+        has_bold = elem.get('has_bold', False)
+        has_italic = elem.get('has_italic', False)
+        font_size_pt = elem.get('font_size_pt')
+        font_color_rgb = elem.get('font_color_rgb')
+        fill_color = elem.get('fill_color')
+        shape_category = elem.get('shape_category', 'rectangle')
+        border_color = elem.get('border_color')
+        has_border = elem.get('has_border', True)
+        tikz_shape_style = elem.get('tikz_shape_style', '')
+
+        # Build node style based on element type and shape category
+        style_parts = []
+
+        # Handle shape-specific styles
+        if shape_category == 'oval':
+            style_parts.append("ellipse")
+        elif shape_category == 'callout':
+            style_parts.extend(["rounded corners", "drop shadow"])
+        elif shape_category == 'rounded_rect':
+            style_parts.append("rounded corners=4pt")
+        elif shape_category == 'diamond':
+            style_parts.append("diamond")
+        elif tikz_shape_style:
+            # Use the pre-computed TikZ style
+            style_parts.append(tikz_shape_style)
+
+        # Handle border/draw
+        if has_border:
+            if border_color:
+                r, g, b = border_color
+                style_parts.append(f"draw={{rgb,255:red,{r};green,{g};blue,{b}}}")
+            else:
+                style_parts.append("draw")
+
+        # Handle fill color
+        if fill_color:
+            r, g, b, opacity = fill_color
+            style_parts.append(f"fill={{rgb,255:red,{r};green,{g};blue,{b}}}")
+            if opacity < 1.0:
+                style_parts.append(f"fill opacity={opacity:.2f}")
+        elif shape_category == 'callout':
+            # Default callout fill
+            style_parts.append("fill=yellow!30")
+        elif shape_category in ('rectangle', 'rounded_rect', 'oval') and has_border:
+            # Default fill for bordered shapes
+            style_parts.append("fill=blue!10")
+
+        # Text width based on relative width
+        text_width_cm = rel_width * 16  # Approximate: 16cm for textwidth in beamer 169
+        style_parts.append(f"text width={text_width_cm:.1f}cm")
+        style_parts.append("align=center" if shape_category in ('oval', 'callout', 'diamond') else "align=left")
+        style_parts.append("anchor=north west")
+
+        style_str = ", ".join(style_parts)
+
+        # Text formatting
+        font_cmds = []
+        if has_bold:
+            font_cmds.append("\\bfseries")
+        if has_italic:
+            font_cmds.append("\\itshape")
+        if font_size_pt:
+            if font_size_pt < 8:
+                font_cmds.append("\\tiny")
+            elif font_size_pt < 10:
+                font_cmds.append("\\scriptsize")
+            elif font_size_pt < 11:
+                font_cmds.append("\\footnotesize")
+            elif font_size_pt < 12:
+                font_cmds.append("\\small")
+            elif font_size_pt > 18:
+                font_cmds.append("\\Large")
+            elif font_size_pt > 14:
+                font_cmds.append("\\large")
+
+        font_prefix = " ".join(font_cmds) + " " if font_cmds else ""
+
+        # Text color
+        color_prefix = ""
+        if font_color_rgb:
+            r, g, b = font_color_rgb
+            color_prefix = f"\\color[RGB]{{{r},{g},{b}}}"
+
+        # Position in TikZ coordinates
+        x_pos = rel_x * canvas_width
+        y_pos = (1 - rel_y) * canvas_height  # Invert y
+
+        lines.append(f"  \\node[{style_str}] at ({x_pos:.3f}\\textwidth, {y_pos:.3f}\\textheight) {{{color_prefix}{font_prefix}{text}}};")
+
+    def slide_to_latex(self, slide, slide_num: int, slide_width=None, slide_height=None) -> dict:
+        """Convert a single slide to LaTeX frame using comprehensive shape extraction.
+
+        Returns dict with 'section', 'subsection', 'latex' keys for proper section management.
+        """
+        lines = []
+
+        # Use the comprehensive content extraction
         content = self.get_all_shape_content(slide, slide_num, slide_width, slide_height)
 
         title = content['title']
@@ -808,35 +1949,47 @@ class PPTXToLatexConverter:
         content_items = content['content_items']
         images = content['images']
         videos = content['videos']
-        tikz_shapes = content['tikz_shapes']
+        positioned_elements = content['positioned_elements']
+        needs_unified_tikz = content['needs_unified_tikz']
 
         # If no title found, try to use first content as title
         if not title and content_items:
             title = content_items[0].get('raw_text', content_items[0]['text'])
             content_items = content_items[1:]
 
-        # Build the frame
-        escaped_title = self.escape_latex(title) if title else "Slide"
-        lines.append(f"\\begin{{frame}}{{{escaped_title}}}")
+        # Extract sources from content items and from content dict
+        content_items, sources = self.extract_sources_from_content(content_items)
+        # Add any sources extracted during shape processing
+        sources.extend(content.get('sources', []))
 
-        # Add subtitle if present (as framesubtitle)
-        if subtitle:
-            escaped_subtitle = self.escape_latex(subtitle)
-            lines.append(f"\\framesubtitle{{{escaped_subtitle}}}")
+        # Estimate content density
+        density = self.estimate_content_density(content_items, images, videos, positioned_elements)
+
+        # Build the frame with secname/subsecname structure
+        if density['is_text_heavy']:
+            lines.append(r"\begin{frame}[shrink]{\secname\vspace{0.1cm}\\\textcolor{anthrazit!80!white}{\subsecname}}")
+        else:
+            lines.append(r"\begin{frame}{\secname\vspace{0.1cm}\\\textcolor{anthrazit!80!white}{\subsecname}}")
 
         # Add content as itemize if there are bullet points
         if content_items:
             has_bullets = any(item.get('is_bullet', False) for item in content_items)
 
             if has_bullets:
+                strip_font_sizes = density['is_text_heavy']
                 lines.append("\\begin{itemize}")
                 current_level = 0
                 for item in content_items:
                     level = item.get('level', 0)
-                    # Text is already formatted and escaped
                     text = item['text']
 
-                    # Handle nesting
+                    if strip_font_sizes:
+                        text = re.sub(
+                            r'\{\\(?:tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)\s+([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}',
+                            r'\1',
+                            text
+                        )
+
                     while level > current_level:
                         lines.append("  " * (current_level + 1) + "\\begin{itemize}")
                         current_level += 1
@@ -846,48 +1999,105 @@ class PPTXToLatexConverter:
 
                     lines.append("  " * (level + 1) + f"\\item {text}")
 
-                # Close any open itemize environments
                 while current_level > 0:
                     lines.append("  " * current_level + "\\end{itemize}")
                     current_level -= 1
                 lines.append("\\end{itemize}")
             else:
-                # Just paragraphs - text is already formatted
                 for item in content_items:
                     text = item['text']
                     lines.append(f"{text}")
                     lines.append("")
 
-        # Add images with appropriate sizing
-        for img_info in images:
-            filename = img_info['filename']
-            width_ratio = img_info.get('width_ratio', 0.8)
-            lines.append(f"\\begin{{center}}")
-            lines.append(f"  \\includegraphics[width={width_ratio}\\textwidth]{{{filename}}}")
-            lines.append(f"\\end{{center}}")
+        # Maximum image height
+        max_image_height = 0.75
 
-        # Add TikZ shapes (callouts, arrows, etc.)
-        for tikz in tikz_shapes:
-            lines.append("")
-            lines.append("% AutoShape converted to TikZ")
-            lines.append(tikz)
+        # Render images and positioned elements
+        if needs_unified_tikz:
+            # Unified TikZ rendering for multiple images or images + shapes
+            lines.extend(self.render_unified_tikz(images, positioned_elements, max_image_height))
+        elif images:
+            # Single image or overlapping images without positioned elements
+            image_groups = self.group_overlapping_images(images)
+            has_overlapping = any(len(g) > 1 for g in image_groups)
 
-        # Add videos (using movie15 package from beamertheme.sty)
+            if has_overlapping:
+                for group in image_groups:
+                    if len(group) == 1:
+                        img_info = group[0]
+                        width_ratio = img_info.get('width_ratio', 0.8)
+                        lines.extend(self.render_image_with_overlays(img_info, width_ratio, max_image_height))
+                    else:
+                        lines.append("% Overlapping images with animation")
+                        lines.append("\\begin{center}")
+                        lines.append("\\begin{tikzpicture}")
+                        for idx, img_info in enumerate(group):
+                            filename = img_info['filename']
+                            width_ratio = img_info.get('width_ratio', 0.8)
+                            if idx == 0:
+                                lines.append(f"  \\node[anchor=center] (img{idx}) {{\\includegraphics[width={width_ratio}\\textwidth,height={max_image_height}\\textheight,keepaspectratio]{{{filename}}}}};")
+                            else:
+                                overlay_num = idx + 1
+                                lines.append(f"  \\onslide<{overlay_num}->{{\\node[anchor=center] at (img0.center) {{\\includegraphics[width={width_ratio}\\textwidth,height={max_image_height}\\textheight,keepaspectratio]{{{filename}}}}};}}")
+                        lines.append("\\end{tikzpicture}")
+                        lines.append("\\end{center}")
+            else:
+                for img_info in images:
+                    width_ratio = img_info.get('width_ratio', 0.8)
+                    if density['is_image_heavy'] and density['recommended_image_height']:
+                        height_ratio = density['recommended_image_height']
+                    else:
+                        height_ratio = max_image_height
+                    lines.extend(self.render_image_with_overlays(img_info, width_ratio, height_ratio))
+        elif positioned_elements:
+            # Only positioned elements, no images
+            lines.append("\\begin{center}")
+            lines.append("\\begin{tikzpicture}")
+            for elem in positioned_elements:
+                self._render_positioned_element(lines, elem, 0.9, max_image_height)
+            lines.append("\\end{tikzpicture}")
+            lines.append("\\end{center}")
+
+        # Add videos
         for vid in videos:
             lines.append(f"% Video: {vid}")
             lines.append("\\includemovie[")
+            lines.append("    inline=false,")
             lines.append("    attach=false,")
             lines.append("    autoplay,")
-            lines.append("    text={\\includegraphics[width=\\textwidth]{videos/generic-thumbnail.jpg}}")
-            lines.append("]{\\textwidth}{\\textheight}{videos/" + vid + "}")
+            lines.append(f"    text={{\\includegraphics[width=0.9\\textwidth,height={max_image_height}\\textheight,keepaspectratio]{{videos/generic-thumbnail.jpg}}}}")
+            vid_path = "videos/" + vid
+            lines.append(f"]{{0.9\\textwidth}}{{{max_image_height}\\textheight}}{{{vid_path}}}")
+
+        # Add source command if sources were found
+        if sources:
+            combined_sources = "; ".join(sources)
+            lines.append(f"    \\source{{{self.escape_latex(combined_sources)}}}")
 
         lines.append("\\end{frame}")
         lines.append("")
 
-        return '\n'.join(lines)
+        return {
+            'section': title if title else "Slide",
+            'subsection': subtitle if subtitle else "",
+            'latex': '\n'.join(lines)
+        }
 
-    def convert(self) -> str:
-        """Convert the entire presentation to LaTeX."""
+    def sanitize_filename(self, name: str) -> str:
+        """Convert a string to a safe filename."""
+        # Replace problematic characters
+        safe = re.sub(r'[^\w\s\-]', '', name)
+        safe = re.sub(r'\s+', '-', safe)
+        return safe[:50]  # Limit length
+
+    def convert(self) -> dict:
+        """Convert the entire presentation to LaTeX.
+
+        Returns a dict with:
+        - 'title_info': dict with title, subtitle, author, date
+        - 'sections': list of dicts with 'name', 'filename', 'content' (per-section LaTeX)
+        - 'thank_you': dict with thank you slide info
+        """
         # Patch the PPTX to handle missing content types
         patched_path = patch_pptx_content_types(str(self.input_path))
         temp_dir_to_cleanup = None
@@ -905,14 +2115,6 @@ class PPTXToLatexConverter:
         slide_width = prs.slide_width
         slide_height = prs.slide_height
 
-        # Build LaTeX document
-        latex_lines = [
-            "\\documentclass[aspectratio=169]{beamer}",
-            "\\usepackage{beamertheme}",
-            "",
-            "% Presentation metadata",
-        ]
-
         # Extract title slide info from first slide
         title_info = {'title': 'Presentation', 'subtitle': '', 'author': '', 'date': '\\today'}
         if prs.slides:
@@ -920,25 +2122,12 @@ class PPTXToLatexConverter:
             if self.is_title_slide(first_slide, 0):
                 title_info.update(self.extract_title_info(first_slide))
 
-        # Extract subtitle and author separately
-        subtitle = title_info['subtitle'] if title_info['subtitle'] else ''
-        author_name = title_info['author'] if title_info['author'] else ''
-
-        latex_lines.extend([
-            f"\\title{{{self.escape_latex(title_info['title'])}}}",
-            f"\\subtitle{{{self.escape_latex(subtitle)}}}",
-            f"\\author{{{self.escape_latex(author_name)}}}",
-            f"\\date{{{title_info['date'] if title_info['date'] else '\\\\today'}}}",
-            "",
-            "\\begin{document}",
-            "",
-            "% Title slide",
-            "\\maketitle",
-            "",
-        ])
-
-        # Process each slide
-        thank_you_slide_content = None
+        # Process each slide and organize by section
+        sections = []  # List of {'name': section_name, 'filename': safe_filename, 'content': [lines]}
+        current_section = None
+        current_section_data = None
+        current_subsection = None
+        thank_you_info = None
 
         for i, slide in enumerate(prs.slides):
             slide_num = i + 1
@@ -949,49 +2138,285 @@ class PPTXToLatexConverter:
 
             # Handle thank you slide specially
             if self.is_thank_you_slide(slide):
-                # Store for later - we'll add it at the end using \thankyou
-                thank_you_slide_content = slide
+                thank_text = "Thank you for your attention!"
+                for shape in slide.shapes:
+                    if hasattr(shape, 'text') and shape.text:
+                        text = self.clean_text(shape.text)
+                        if text and ('thank' in text.lower() or 'danke' in text.lower()):
+                            thank_text = text
+                            break
+                thank_you_info = {'text': thank_text}
                 continue
 
-            latex_lines.append(f"% Slide {slide_num}")
-            latex_lines.append(self.slide_to_latex(slide, slide_num, slide_width, slide_height))
+            # Get slide content with section/subsection info
+            slide_data = self.slide_to_latex(slide, slide_num, slide_width, slide_height)
+            section = slide_data['section']
+            subsection = slide_data['subsection']
+            frame_latex = slide_data['latex']
 
-        # Add thank you slide at the end, using the author name from the title slide
-        escaped_author = self.escape_latex(author_name) if author_name else "Author Name"
-        if thank_you_slide_content:
-            latex_lines.append("% Thank you slide")
-            # Extract any text from the thank you slide for the message
-            thank_text = "Thank you for your attention!"
-            for shape in thank_you_slide_content.shapes:
-                if hasattr(shape, 'text') and shape.text:
-                    text = self.clean_text(shape.text)
-                    if text and ('thank' in text.lower() or 'danke' in text.lower()):
-                        thank_text = text
-                        break
+            # Check if we need to start a new section
+            if section != current_section:
+                # Save previous section if exists
+                if current_section_data:
+                    sections.append(current_section_data)
 
-            latex_lines.append(f"\\thankyou{{{self.escape_latex(thank_text)}}}{{{escaped_author}}}{{Position}}{{email@example.com}}{{theme/logos/drop.png}}")
-        else:
-            # Add a default thank you slide
-            latex_lines.append("% Thank you slide")
-            latex_lines.append(f"\\thankyou{{Thank you for your attention!}}{{{escaped_author}}}{{Position}}{{email@example.com}}{{theme/logos/drop.png}}")
+                # Start new section
+                section_num = len(sections) + 1
+                safe_name = self.sanitize_filename(section)
+                current_section_data = {
+                    'name': section,
+                    'filename': f"section-{section_num:02d}-{safe_name}",
+                    'content': []
+                }
+                current_section = section
+                current_subsection = None
 
-        latex_lines.extend([
-            "",
-            "\\end{document}",
-        ])
+                # Add section command
+                escaped_section = self.escape_latex(section)
+                current_section_data['content'].append(f"\\section{{{escaped_section}}}")
+
+            # Emit \subsection only when subsection changes
+            if subsection != current_subsection:
+                escaped_subsection = self.escape_latex(subsection) if subsection else ""
+                current_section_data['content'].append(f"\\subsection{{{escaped_subsection}}}")
+                current_subsection = subsection
+
+            # Add frame content
+            current_section_data['content'].append(f"% Slide {slide_num}")
+            current_section_data['content'].append(frame_latex)
+
+        # Don't forget the last section
+        if current_section_data:
+            sections.append(current_section_data)
 
         # Clean up temporary patched file
         if temp_dir_to_cleanup:
             shutil.rmtree(temp_dir_to_cleanup, ignore_errors=True)
 
-        return '\n'.join(latex_lines)
+        return {
+            'title_info': title_info,
+            'sections': sections,
+            'thank_you': thank_you_info
+        }
+
+    def create_output_folder(self) -> Path:
+        """Create the output folder structure for the converted presentation."""
+        # Get presentation name without extension
+        pptx_name = self.input_path.stem
+
+        # Create output in tex-output subfolder (relative to script location)
+        script_dir = Path(__file__).parent
+        tex_output_dir = script_dir / 'tex-output'
+        tex_output_dir.mkdir(exist_ok=True)
+
+        # Create presentation-specific folder
+        output_folder = tex_output_dir / pptx_name
+        output_folder.mkdir(exist_ok=True)
+
+        # Create subfolders
+        (output_folder / 'fig').mkdir(exist_ok=True)
+        (output_folder / 'videos').mkdir(exist_ok=True)
+        (output_folder / 'theme').mkdir(exist_ok=True)
+
+        # Copy generic video thumbnail to videos folder
+        script_dir = Path(__file__).parent
+        template_dir = script_dir / 'template'
+        thumbnail_src = template_dir / 'videos' / 'generic-thumbnail.jpg'
+        if thumbnail_src.exists():
+            shutil.copy2(thumbnail_src, output_folder / 'videos' / 'generic-thumbnail.jpg')
+
+        return output_folder
+
+    def copy_theme_files(self, output_folder: Path):
+        """Copy theme files to the output folder."""
+        # Look for theme files in template/ subdirectory
+        script_dir = Path(__file__).parent
+        template_dir = script_dir / 'template'
+
+        # Copy beamertheme.sty - try template dir first, then input parent
+        theme_sty = template_dir / 'beamertheme.sty'
+        if not theme_sty.exists():
+            theme_sty = self.input_path.parent / 'beamertheme.sty'
+        if theme_sty.exists():
+            shutil.copy2(theme_sty, output_folder / 'beamertheme.sty')
+
+        # Copy theme folder contents - try template dir first, then input parent
+        theme_src = template_dir / 'theme'
+        if not theme_src.exists():
+            theme_src = self.input_path.parent / 'theme'
+        theme_dst = output_folder / 'theme'
+        if theme_src.exists():
+            # Copy all files from theme folder
+            for item in theme_src.iterdir():
+                if item.is_file():
+                    shutil.copy2(item, theme_dst / item.name)
+                elif item.is_dir():
+                    dst_subdir = theme_dst / item.name
+                    if dst_subdir.exists():
+                        shutil.rmtree(dst_subdir)
+                    shutil.copytree(item, dst_subdir)
+
+    def generate_main_tex(self, output_folder: Path, conversion_data: dict) -> str:
+        """Generate the main TEX file from template."""
+        # Look for template in template/ subdirectory
+        script_dir = Path(__file__).parent
+        template_dir = script_dir / 'template'
+        template_path = template_dir / 'beamer-main-template.tex'
+        if not template_path.exists():
+            template_path = self.input_path.parent / 'beamer-main-template.tex'
+
+        if template_path.exists():
+            with open(template_path, 'r', encoding='utf-8') as f:
+                template = f.read()
+        else:
+            # Fallback template
+            template = """% !TeX spellcheck = en_US
+\\documentclass[aspectratio=169]{beamer}
+\\usepackage{beamertheme}
+
+\\title{PRESENTATION TITLE}
+\\author[AUTHOR]{AUTHOR}
+\\subtitle{DATE}
+
+\\begin{document}
+
+\\maketitle
+
+\\begin{frame}{Table of Contents}
+    \\tableofcontents
+\\end{frame}
+
+\\include{REPLACE WITH SLIDE SECTION 1}
+\\include{REPLACE WITH SLIDE SECTION 2}
+\\include{REPLACE WITH SLIDE SECTION ...}
+
+\\thankyou{Thank you for your attention}{AUTHOR}{}{EMAIL}{theme/logos/drop.png}
+\\end{document}
+"""
+
+        title_info = conversion_data['title_info']
+        sections = conversion_data['sections']
+        thank_you = conversion_data['thank_you']
+
+        # Replace placeholders
+        main_tex = template
+
+        # Replace \usetheme{lww} with \usepackage{beamertheme} for compatibility
+        main_tex = re.sub(r'\\usetheme\{lww\}', r'\\usepackage{beamertheme}', main_tex)
+
+        # Replace title
+        main_tex = main_tex.replace('PRESENTATION TITLE', self.escape_latex(title_info['title']))
+
+        # Replace author (handle both forms)
+        author = title_info['author'] if title_info['author'] else 'Author'
+        main_tex = main_tex.replace('\\author[AUTHOR]{AUHTOR}', f'\\author[{self.escape_latex(author)}]{{{self.escape_latex(author)}}}')
+        main_tex = main_tex.replace('\\author[AUTHOR]{AUTHOR}', f'\\author[{self.escape_latex(author)}]{{{self.escape_latex(author)}}}')
+        main_tex = re.sub(r'AUTHOR', self.escape_latex(author), main_tex)
+
+        # Replace date/subtitle
+        subtitle = title_info['subtitle'] if title_info['subtitle'] else '\\today'
+        main_tex = main_tex.replace('\\subtitle{DATE}', f'\\subtitle{{{self.escape_latex(subtitle)}}}')
+
+        # Replace email placeholder
+        main_tex = main_tex.replace('EMAIL', 'email@example.com')
+
+        # Generate include statements
+        include_lines = []
+        for section in sections:
+            include_lines.append(f"\\include{{{section['filename']}}}")
+
+        # Replace the template include placeholders
+        # Find and replace the include block
+        include_pattern = r'\\include\{REPLACE WITH SLIDE SECTION[^}]*\}(\s*\\include\{REPLACE WITH SLIDE SECTION[^}]*\})*'
+        include_block = '\n'.join(include_lines)
+        # Escape backslashes for regex replacement
+        include_block_escaped = include_block.replace('\\', '\\\\')
+        main_tex = re.sub(include_pattern, include_block_escaped, main_tex)
+
+        # Update thank you slide
+        if thank_you:
+            thank_text = self.escape_latex(thank_you['text'])
+        else:
+            thank_text = 'Thank you for your attention!'
+
+        # Replace the thankyou command
+        thankyou_pattern = r'\\thankyou\{[^}]*\}\{[^}]*\}\{[^}]*\}\{[^}]*\}\{[^}]*\}'
+        thankyou_replacement = f'\\\\thankyou{{{thank_text}}}{{{self.escape_latex(author)}}}{{}}{{email@example.com}}{{theme/logos/drop.png}}'
+        main_tex = re.sub(thankyou_pattern, thankyou_replacement, main_tex)
+
+        return main_tex
+
+    def generate_texstudio_project(self, output_folder: Path, main_tex_name: str) -> str:
+        """Generate the TexStudio project file."""
+        project = {
+            "InternalPDFViewer": {
+                "Embedded": True,
+                "File": main_tex_name.replace('.tex', '.pdf')
+            },
+            "Session": {
+                "Bookmarks": [],
+                "CurrentFile": main_tex_name,
+                "FileVersion": 1,
+                "Files": [
+                    {
+                        "Col": 0,
+                        "EditorGroup": 0,
+                        "FileName": main_tex_name,
+                        "FirstLine": 0,
+                        "FoldedLines": "",
+                        "Line": 0
+                    }
+                ],
+                "MasterFile": "",
+                "VerticalSplit": False
+            }
+        }
+        return json.dumps(project, indent=4)
 
     def save(self):
-        """Convert and save the LaTeX output."""
-        latex_content = self.convert()
+        """Convert and save the LaTeX output to organized folder structure."""
+        # Create output folder structure FIRST (before conversion)
+        output_folder = self.create_output_folder()
 
-        with open(self.output_path, 'w', encoding='utf-8') as f:
-            f.write(latex_content)
+        # Update fig_dir and video_dir to point to new location BEFORE conversion
+        self.fig_dir = output_folder / 'fig'
+        self.video_dir = output_folder / 'videos'
+
+        # Ensure directories exist
+        self.fig_dir.mkdir(parents=True, exist_ok=True)
+        self.video_dir.mkdir(parents=True, exist_ok=True)
+
+        # Reset counters for fresh extraction
+        self.image_counter = 0
+        self.video_counter = 0
+
+        # Now convert the presentation (images will be extracted to new location)
+        conversion_data = self.convert()
+
+        # Copy theme files
+        self.copy_theme_files(output_folder)
+
+        # Write per-section TEX files
+        for section in conversion_data['sections']:
+            section_path = output_folder / f"{section['filename']}.tex"
+            with open(section_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(section['content']))
+
+        # Generate and write main TEX file
+        main_tex_content = self.generate_main_tex(output_folder, conversion_data)
+        main_tex_path = output_folder / 'beamer-main.tex'
+        with open(main_tex_path, 'w', encoding='utf-8') as f:
+            f.write(main_tex_content)
+
+        # Generate and write TexStudio project file
+        project_content = self.generate_texstudio_project(output_folder, 'beamer-main.tex')
+        project_path = output_folder / 'beamerProject-TexStudio.txss2'
+        with open(project_path, 'w', encoding='utf-8') as f:
+            f.write(project_content)
+
+        print(f"  Output folder: {output_folder}")
+        print(f"  Main file: beamer-main.tex")
+        print(f"  Section files: {len(conversion_data['sections'])}")
 
         print(f"Converted: {self.input_path} -> {self.output_path}")
         print(f"  Images saved to: {self.fig_dir}/")

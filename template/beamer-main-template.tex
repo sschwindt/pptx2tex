@@ -1,0 +1,47 @@
+% !TeX spellcheck = en_US
+% COMPILE WITH LuaLatex !!!
+
+% Other paper formats are possible: aspectratio = 43 (4:3), 169 (16:9), etc...
+% If you set the option "handout", overlay effects will be ignored:
+%\documentclass[aspectratio=43,handout]{beamer}
+\documentclass[8pt, t,
+aspectratio=169,% for widescreen (16:9) presentations
+% aspectratio=43,% for traditional (4:3) presentations
+% handout,%
+]{beamer}
+
+\usepackage[utf8]{}
+\usepackage[T1]{fontenc}
+\usepackage{circledsteps}
+
+% Title and author
+\title{PRESENTATION TITLE} % If needed, manually add line breaks with "\\"
+\author[AUTHOR]{AUHTOR}
+%\title{\footnotesize If the title is very long and does not fit easily, you might want to manually use a smaller font here.}
+
+\subtitle{DATE}
+
+\usetheme{lww}
+
+% for ecosystem services mitigating extreme weather, see https://en.wikipedia.org/wiki/Millennium_Ecosystem_Assessment
+\begin{document}
+
+% Create the titlepage
+\maketitle
+
+% Optional: show the outline
+%\begin{frame}{Table of Contents}
+%	\tableofcontents
+%\end{frame}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% slides %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{frame}{Table of Contents}
+	\tableofcontents
+\end{frame}
+\include{REPLACE WITH SLIDE SECTION 1}
+\include{REPLACE WITH SLIDE SECTION 2}
+\include{REPLACE WITH SLIDE SECTION ...}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% final slide %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\thankyou{Thank you for your attention}{AUTHOR}{}{EMAIL}{theme/logos/drop.png}
+\end{document}
