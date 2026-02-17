@@ -55,7 +55,7 @@ The `template/` directory contains the source files that are copied to each outp
 
 ## Disclaimer
 
-This code was vibecoded with [Claude Code](https://claude.ai/code) (Anthropic's AI coding assistant).
+This code was vibecoded with [Claude Code](https://claude.ai/code) by Anthropic.
 
 ## License
 

@@ -112,6 +112,15 @@ def patch_pptx_content_types(pptx_path: str) -> str:
 class PPTXToLatexConverter:
     """Converts PPTX presentations to LaTeX Beamer format."""
 
+    # Standard aspect ratios (width:height ratios)
+    ASPECT_RATIO_4_3 = 4 / 3      # 1.333...
+    ASPECT_RATIO_16_9 = 16 / 9    # 1.777...
+    ASPECT_RATIO_16_10 = 16 / 10  # 1.6
+
+    # Beamer 16:9 dimensions (approximately)
+    BEAMER_169_TEXTWIDTH_CM = 15.8   # Actual textwidth in beamer 16:9
+    BEAMER_169_TEXTHEIGHT_CM = 8.0   # Usable text height (excluding header/footer)
+
     def __init__(self, input_path: str, output_path: str,
                  fig_dir: str = "fig", video_dir: str = "videos"):
         self.input_path = Path(input_path)
@@ -121,9 +130,140 @@ class PPTXToLatexConverter:
         self.image_counter = 0
         self.video_counter = 0
 
+        # Aspect ratio tracking - set during conversion
+        self.source_slide_width = None   # EMU
+        self.source_slide_height = None  # EMU
+        self.source_aspect_ratio = None  # width/height
+        self.target_aspect_ratio = self.ASPECT_RATIO_16_9  # Output is always 16:9
+
         # Ensure output directories exist
         self.fig_dir.mkdir(parents=True, exist_ok=True)
         self.video_dir.mkdir(parents=True, exist_ok=True)
+
+    def detect_aspect_ratio(self, slide_width, slide_height) -> float:
+        """Detect the aspect ratio of the source presentation.
+
+        Args:
+            slide_width: Width in EMU
+            slide_height: Height in EMU
+
+        Returns:
+            Aspect ratio (width/height)
+        """
+        if not slide_width or not slide_height or slide_height == 0:
+            return self.ASPECT_RATIO_4_3  # Default to 4:3
+
+        ratio = slide_width / slide_height
+
+        # Store for later use
+        self.source_slide_width = slide_width
+        self.source_slide_height = slide_height
+        self.source_aspect_ratio = ratio
+
+        return ratio
+
+    def get_aspect_ratio_name(self, ratio: float) -> str:
+        """Get a human-readable name for an aspect ratio."""
+        if abs(ratio - self.ASPECT_RATIO_4_3) < 0.05:
+            return "4:3"
+        elif abs(ratio - self.ASPECT_RATIO_16_9) < 0.05:
+            return "16:9"
+        elif abs(ratio - self.ASPECT_RATIO_16_10) < 0.05:
+            return "16:10"
+        else:
+            return f"{ratio:.2f}:1"
+
+    def compute_canvas_dimensions(self, max_height: float = 0.75) -> tuple:
+        """Compute canvas dimensions for TikZ that preserve aspect ratio relationships.
+
+        When converting from 4:3 to 16:9, we need to handle the fact that
+        the 4:3 content is relatively taller compared to width than 16:9.
+
+        Args:
+            max_height: Maximum height as fraction of textheight
+
+        Returns:
+            Tuple of (canvas_width, canvas_height) as fractions of textwidth/textheight
+        """
+        if self.source_aspect_ratio is None:
+            # No source info - use defaults
+            return (0.9, max_height)
+
+        # Ratio of source to target aspect ratios
+        # If source is 4:3 (1.333) and target is 16:9 (1.777), ratio = 0.75
+        # This means source content is relatively wider for its height
+        aspect_scale = self.source_aspect_ratio / self.target_aspect_ratio
+
+        if aspect_scale < 1.0:
+            # Source is narrower (taller) than target - e.g., 4:3 -> 16:9
+            # Content will have letterboxing on sides
+            # Scale width down to maintain proportions
+            canvas_width = 0.9 * aspect_scale
+            canvas_height = max_height
+        else:
+            # Source is wider than target (unlikely with 16:9 output)
+            # Content will have letterboxing on top/bottom
+            canvas_width = 0.9
+            canvas_height = max_height / aspect_scale
+
+        return (canvas_width, canvas_height)
+
+    def transform_x_coordinate(self, rel_x: float, canvas_width: float) -> float:
+        """Transform a relative X coordinate from source to target aspect ratio.
+
+        Args:
+            rel_x: X position as fraction of source slide width (0-1)
+            canvas_width: Canvas width fraction
+
+        Returns:
+            X position in TikZ coordinates (fraction of textwidth)
+        """
+        if self.source_aspect_ratio is None:
+            return rel_x * canvas_width
+
+        aspect_scale = self.source_aspect_ratio / self.target_aspect_ratio
+
+        if aspect_scale < 1.0:
+            # Source narrower - center content horizontally
+            # Add offset to center the content
+            offset = (0.9 - canvas_width) / 2
+            return offset + rel_x * canvas_width
+        else:
+            return rel_x * canvas_width
+
+    def transform_dimensions(self, rel_w: float, rel_h: float,
+                           canvas_width: float, canvas_height: float) -> tuple:
+        """Transform relative dimensions from source to target aspect ratio.
+
+        Maintains the visual proportions of shapes when converting between
+        aspect ratios.
+
+        Args:
+            rel_w: Width as fraction of source slide width
+            rel_h: Height as fraction of source slide height
+            canvas_width: Canvas width fraction
+            canvas_height: Canvas height fraction
+
+        Returns:
+            Tuple of (width_fraction, height_fraction) for TikZ
+        """
+        img_width = rel_w * canvas_width
+        img_height = rel_h * canvas_height
+
+        return (img_width, img_height)
+
+    def get_textwidth_cm(self) -> float:
+        """Get the effective textwidth in cm for the current aspect ratio conversion."""
+        if self.source_aspect_ratio is None:
+            return self.BEAMER_169_TEXTWIDTH_CM
+
+        aspect_scale = self.source_aspect_ratio / self.target_aspect_ratio
+
+        if aspect_scale < 1.0:
+            # Content narrower - effective width is scaled
+            return self.BEAMER_169_TEXTWIDTH_CM * aspect_scale
+        else:
+            return self.BEAMER_169_TEXTWIDTH_CM
 
     def escape_latex(self, text: str) -> str:
         """Escape special LaTeX characters."""
@@ -145,6 +285,214 @@ class PPTXToLatexConverter:
         ]
 
         for old, new in replacements:
+            text = text.replace(old, new)
+
+        # Convert math symbols after escaping special characters
+        text = self.convert_math_symbols(text)
+
+        return text
+
+    def convert_math_symbols(self, text: str) -> str:
+        """Convert mathematical symbols to LaTeX math mode equivalents."""
+        if not text:
+            return ""
+
+        # Unicode math symbols to LaTeX math mode
+        math_symbols = [
+            # Comparison operators
+            ('≥', r'$\geq$'),
+            ('≤', r'$\leq$'),
+            ('≠', r'$\neq$'),
+            ('≈', r'$\approx$'),
+            ('≡', r'$\equiv$'),
+            ('≢', r'$\not\equiv$'),
+            ('≪', r'$\ll$'),
+            ('≫', r'$\gg$'),
+            ('∝', r'$\propto$'),
+            ('≃', r'$\simeq$'),
+            ('≅', r'$\cong$'),
+            ('≲', r'$\lesssim$'),
+            ('≳', r'$\gtrsim$'),
+            # ASCII comparison sequences (must come after Unicode)
+            ('>=', r'$\geq$'),
+            ('<=', r'$\leq$'),
+            ('!=', r'$\neq$'),
+            ('~=', r'$\approx$'),
+            ('<<', r'$\ll$'),
+            ('>>', r'$\gg$'),
+            # Arithmetic operators
+            ('×', r'$\times$'),
+            ('÷', r'$\div$'),
+            ('±', r'$\pm$'),
+            ('∓', r'$\mp$'),
+            ('·', r'$\cdot$'),  # middle dot
+            ('∙', r'$\bullet$'),
+            ('⋅', r'$\cdot$'),  # dot operator
+            # Greek letters (lowercase)
+            ('α', r'$\alpha$'),
+            ('β', r'$\beta$'),
+            ('γ', r'$\gamma$'),
+            ('δ', r'$\delta$'),
+            ('ε', r'$\varepsilon$'),
+            ('ζ', r'$\zeta$'),
+            ('η', r'$\eta$'),
+            ('θ', r'$\theta$'),
+            ('ι', r'$\iota$'),
+            ('κ', r'$\kappa$'),
+            ('λ', r'$\lambda$'),
+            ('μ', r'$\mu$'),
+            ('ν', r'$\nu$'),
+            ('ξ', r'$\xi$'),
+            ('π', r'$\pi$'),
+            ('ρ', r'$\rho$'),
+            ('σ', r'$\sigma$'),
+            ('τ', r'$\tau$'),
+            ('υ', r'$\upsilon$'),
+            ('φ', r'$\varphi$'),
+            ('χ', r'$\chi$'),
+            ('ψ', r'$\psi$'),
+            ('ω', r'$\omega$'),
+            # Greek letters (uppercase)
+            ('Α', r'A'),  # Alpha looks like A
+            ('Β', r'B'),  # Beta looks like B
+            ('Γ', r'$\Gamma$'),
+            ('Δ', r'$\Delta$'),
+            ('Ε', r'E'),  # Epsilon looks like E
+            ('Ζ', r'Z'),  # Zeta looks like Z
+            ('Η', r'H'),  # Eta looks like H
+            ('Θ', r'$\Theta$'),
+            ('Ι', r'I'),  # Iota looks like I
+            ('Κ', r'K'),  # Kappa looks like K
+            ('Λ', r'$\Lambda$'),
+            ('Μ', r'M'),  # Mu looks like M
+            ('Ν', r'N'),  # Nu looks like N
+            ('Ξ', r'$\Xi$'),
+            ('Ο', r'O'),  # Omicron looks like O
+            ('Π', r'$\Pi$'),
+            ('Ρ', r'P'),  # Rho looks like P
+            ('Σ', r'$\Sigma$'),
+            ('Τ', r'T'),  # Tau looks like T
+            ('Υ', r'$\Upsilon$'),
+            ('Φ', r'$\Phi$'),
+            ('Χ', r'X'),  # Chi looks like X
+            ('Ψ', r'$\Psi$'),
+            ('Ω', r'$\Omega$'),
+            # Arrows
+            ('→', r'$\rightarrow$'),
+            ('←', r'$\leftarrow$'),
+            ('↔', r'$\leftrightarrow$'),
+            ('⇒', r'$\Rightarrow$'),
+            ('⇐', r'$\Leftarrow$'),
+            ('⇔', r'$\Leftrightarrow$'),
+            ('↑', r'$\uparrow$'),
+            ('↓', r'$\downarrow$'),
+            ('↗', r'$\nearrow$'),
+            ('↘', r'$\searrow$'),
+            ('↙', r'$\swarrow$'),
+            ('↖', r'$\nwarrow$'),
+            ('⟶', r'$\longrightarrow$'),
+            ('⟵', r'$\longleftarrow$'),
+            # Set theory and logic
+            ('∈', r'$\in$'),
+            ('∉', r'$\notin$'),
+            ('⊂', r'$\subset$'),
+            ('⊃', r'$\supset$'),
+            ('⊆', r'$\subseteq$'),
+            ('⊇', r'$\supseteq$'),
+            ('∩', r'$\cap$'),
+            ('∪', r'$\cup$'),
+            ('∅', r'$\emptyset$'),
+            ('∧', r'$\land$'),
+            ('∨', r'$\lor$'),
+            ('¬', r'$\neg$'),
+            ('∀', r'$\forall$'),
+            ('∃', r'$\exists$'),
+            ('∄', r'$\nexists$'),
+            # Calculus and analysis
+            ('∞', r'$\infty$'),
+            ('∂', r'$\partial$'),
+            ('∇', r'$\nabla$'),
+            ('∫', r'$\int$'),
+            ('∬', r'$\iint$'),
+            ('∭', r'$\iiint$'),
+            ('∮', r'$\oint$'),
+            ('∑', r'$\sum$'),
+            ('∏', r'$\prod$'),
+            ('√', r'$\sqrt{}$'),
+            ('∛', r'$\sqrt[3]{}$'),
+            ('∜', r'$\sqrt[4]{}$'),
+            # Miscellaneous
+            ('°', r'$^\circ$'),
+            ('′', r"$'$"),  # prime
+            ('″', r"$''$"),  # double prime
+            ('‰', r'\textperthousand{}'),
+            ('…', r'\ldots{}'),
+            ('ℓ', r'$\ell$'),
+            ('ℏ', r'$\hbar$'),
+            ('℃', r'$^\circ$C'),
+            ('℉', r'$^\circ$F'),
+            ('Å', r'\AA{}'),
+            ('⊥', r'$\perp$'),
+            ('∥', r'$\parallel$'),
+            ('∠', r'$\angle$'),
+            ('△', r'$\triangle$'),
+            ('□', r'$\square$'),
+            ('◇', r'$\diamond$'),
+            ('★', r'$\star$'),
+            ('☆', r'$\star$'),
+            ('✓', r'$\checkmark$'),
+            ('✗', r'$\times$'),
+            ('†', r'$\dagger$'),
+            ('‡', r'$\ddagger$'),
+            ('§', r'\S{}'),
+            ('¶', r'\P{}'),
+            ('©', r'\copyright{}'),
+            ('®', r'\textregistered{}'),
+            ('™', r'\texttrademark{}'),
+            # Superscripts and subscripts (common ones)
+            ('²', r'$^2$'),
+            ('³', r'$^3$'),
+            ('¹', r'$^1$'),
+            ('⁰', r'$^0$'),
+            ('⁴', r'$^4$'),
+            ('⁵', r'$^5$'),
+            ('⁶', r'$^6$'),
+            ('⁷', r'$^7$'),
+            ('⁸', r'$^8$'),
+            ('⁹', r'$^9$'),
+            ('⁺', r'$^+$'),
+            ('⁻', r'$^-$'),
+            ('₀', r'$_0$'),
+            ('₁', r'$_1$'),
+            ('₂', r'$_2$'),
+            ('₃', r'$_3$'),
+            ('₄', r'$_4$'),
+            ('₅', r'$_5$'),
+            ('₆', r'$_6$'),
+            ('₇', r'$_7$'),
+            ('₈', r'$_8$'),
+            ('₉', r'$_9$'),
+            ('₊', r'$_+$'),
+            ('₋', r'$_-$'),
+            # Fractions
+            ('½', r'$\frac{1}{2}$'),
+            ('⅓', r'$\frac{1}{3}$'),
+            ('⅔', r'$\frac{2}{3}$'),
+            ('¼', r'$\frac{1}{4}$'),
+            ('¾', r'$\frac{3}{4}$'),
+            ('⅕', r'$\frac{1}{5}$'),
+            ('⅖', r'$\frac{2}{5}$'),
+            ('⅗', r'$\frac{3}{5}$'),
+            ('⅘', r'$\frac{4}{5}$'),
+            ('⅙', r'$\frac{1}{6}$'),
+            ('⅚', r'$\frac{5}{6}$'),
+            ('⅛', r'$\frac{1}{8}$'),
+            ('⅜', r'$\frac{3}{8}$'),
+            ('⅝', r'$\frac{5}{8}$'),
+            ('⅞', r'$\frac{7}{8}$'),
+        ]
+
+        for old, new in math_symbols:
             text = text.replace(old, new)
 
         return text
@@ -1005,11 +1353,22 @@ class PPTXToLatexConverter:
             # Slide coordinates: origin top-left, y increases downward
             # TikZ coordinates: we'll use origin top-left too for simplicity
             slide_width_cm = self.emu_to_cm(slide_width) if slide_width else 25.4  # ~10 inches default
-            slide_height_cm = self.emu_to_cm(slide_height) if slide_height else 14.29  # ~5.6 inches default
+            slide_height_cm = self.emu_to_cm(slide_height) if slide_height else 19.05  # 7.5 inches for 4:3 aspect
 
-            # Normalize to textwidth-based coordinates
-            x_pos = left_cm / slide_width_cm
-            y_pos = 1.0 - (top_cm / slide_height_cm)  # Flip y for TikZ
+            # Get canvas dimensions based on aspect ratio
+            canvas_width, canvas_height = self.compute_canvas_dimensions(0.75)
+
+            # Normalize to textwidth/textheight-based coordinates
+            rel_x = left_cm / slide_width_cm
+            rel_y = 1.0 - (top_cm / slide_height_cm)  # Flip y for TikZ
+
+            # Transform for aspect ratio
+            x_pos = self.transform_x_coordinate(rel_x, canvas_width)
+            y_pos = rel_y * canvas_height
+
+            # Adjust text width for aspect ratio
+            effective_textwidth = self.get_textwidth_cm()
+            adj_width_cm = (width_cm / slide_width_cm) * effective_textwidth
 
             # Determine shape style based on AutoShape type
             shape_style = "draw, rounded corners, fill=yellow!20"
@@ -1030,10 +1389,9 @@ class PPTXToLatexConverter:
             except Exception:
                 pass
 
-            # Generate TikZ code
-            # Position as fraction of textwidth, convert to actual position
+            # Generate TikZ code using textheight-based positioning (consistent with render_unified_tikz)
             tikz_code = f"""\\begin{{tikzpicture}}[overlay, remember picture]
-  \\node[{shape_style}, text width={width_cm:.1f}cm, align=center] at ([xshift={x_pos:.2f}\\textwidth, yshift={y_pos * 5:.1f}cm]current page.south west) {{{shape_text}}};
+  \\node[{shape_style}, text width={adj_width_cm:.1f}cm, align=center, anchor=north west] at ([xshift={x_pos:.3f}\\textwidth, yshift={y_pos:.3f}\\textheight]current page.south west) {{{shape_text}}};
 \\end{{tikzpicture}}"""
 
             return tikz_code
@@ -1720,9 +2078,9 @@ class PPTXToLatexConverter:
         lines.append("\\begin{center}")
         lines.append("\\begin{tikzpicture}")
 
-        # Determine the TikZ canvas size based on content
-        canvas_width = 0.9  # fraction of textwidth
-        canvas_height = max_height  # fraction of textheight
+        # Determine the TikZ canvas size based on content and aspect ratio
+        # This properly handles 4:3 to 16:9 conversion by adjusting canvas proportions
+        canvas_width, canvas_height = self.compute_canvas_dimensions(max_height)
 
         # Render images - handle overlapping groups with animation
         img_node_idx = 0
@@ -1738,10 +2096,10 @@ class PPTXToLatexConverter:
                 rel_w = elem['width'] / total_width if total_width else 1
                 rel_h = elem['height'] / total_height if total_height else 1
 
-                x_pos = rel_x * canvas_width
+                # Transform coordinates with aspect ratio compensation
+                x_pos = self.transform_x_coordinate(rel_x, canvas_width)
                 y_pos = (1 - rel_y - rel_h) * canvas_height
-                img_width = rel_w * canvas_width
-                img_height = rel_h * canvas_height
+                img_width, img_height = self.transform_dimensions(rel_w, rel_h, canvas_width, canvas_height)
 
                 lines.append(f"  \\node[anchor=south west, inner sep=0] (img{img_node_idx}) at ({x_pos:.3f}\\textwidth, {y_pos:.3f}\\textheight) {{\\includegraphics[width={img_width:.3f}\\textwidth,height={img_height:.3f}\\textheight,keepaspectratio]{{{filename}}}}};")
 
@@ -1765,10 +2123,10 @@ class PPTXToLatexConverter:
                 group_w = (group_right - group_left) / total_width if total_width else 1
                 group_h = (group_bottom - group_top) / total_height if total_height else 1
 
-                x_pos = rel_x * canvas_width
+                # Transform coordinates with aspect ratio compensation
+                x_pos = self.transform_x_coordinate(rel_x, canvas_width)
                 y_pos = (1 - rel_y - group_h) * canvas_height
-                img_width = group_w * canvas_width
-                img_height = group_h * canvas_height
+                img_width, img_height = self.transform_dimensions(group_w, group_h, canvas_width, canvas_height)
 
                 base_node = f"img{img_node_idx}"
 
@@ -1892,8 +2250,9 @@ class PPTXToLatexConverter:
             # Default fill for bordered shapes
             style_parts.append("fill=blue!10")
 
-        # Text width based on relative width
-        text_width_cm = rel_width * 16  # Approximate: 16cm for textwidth in beamer 169
+        # Text width based on relative width - use aspect ratio-aware textwidth
+        effective_textwidth = self.get_textwidth_cm()
+        text_width_cm = rel_width * effective_textwidth
         style_parts.append(f"text width={text_width_cm:.1f}cm")
         style_parts.append("align=center" if shape_category in ('oval', 'callout', 'diamond') else "align=left")
         style_parts.append("anchor=north west")
@@ -1928,8 +2287,8 @@ class PPTXToLatexConverter:
             r, g, b = font_color_rgb
             color_prefix = f"\\color[RGB]{{{r},{g},{b}}}"
 
-        # Position in TikZ coordinates
-        x_pos = rel_x * canvas_width
+        # Position in TikZ coordinates with aspect ratio compensation
+        x_pos = self.transform_x_coordinate(rel_x, canvas_width)
         y_pos = (1 - rel_y) * canvas_height  # Invert y
 
         lines.append(f"  \\node[{style_str}] at ({x_pos:.3f}\\textwidth, {y_pos:.3f}\\textheight) {{{color_prefix}{font_prefix}{text}}};")
@@ -2114,6 +2473,13 @@ class PPTXToLatexConverter:
         # Get slide dimensions for image sizing
         slide_width = prs.slide_width
         slide_height = prs.slide_height
+
+        # Detect source aspect ratio for proper coordinate transformation
+        source_ratio = self.detect_aspect_ratio(slide_width, slide_height)
+        ratio_name = self.get_aspect_ratio_name(source_ratio)
+        print(f"  Source presentation aspect ratio: {ratio_name} ({source_ratio:.3f})")
+        if abs(source_ratio - self.target_aspect_ratio) > 0.1:
+            print(f"  Converting to 16:9 output - coordinates will be transformed")
 
         # Extract title slide info from first slide
         title_info = {'title': 'Presentation', 'subtitle': '', 'author': '', 'date': '\\today'}
