@@ -226,6 +226,23 @@
   itemsep=0.2em,
   topsep=0.2em,
 }
+% nested levels: keep a visible (smaller) marker so sub-bullets read as bullets
+\setitemize[2]{%
+  label={\usebeamercolor[fg]{itemize subitem}\tikz{\path (0,0); \fill (0em,0.34em) circle (0.10em);}},
+  labelindent=0pt,
+  labelsep=0.5em,
+  leftmargin=1.4em,
+  itemsep=0.1em,
+  topsep=0.1em,
+}
+\setitemize[3]{%
+  label={\usebeamercolor[fg]{itemize subsubitem}\tikz{\path (0,0); \draw[line width=0.4pt] (-0.12em,0.30em) -- (0.12em,0.30em);}},
+  labelindent=0pt,
+  labelsep=0.5em,
+  leftmargin=1.4em,
+  itemsep=0.1em,
+  topsep=0.1em,
+}
 % boarders
 \setbeamersize{text margin left=0.08\paperheight,text margin right=0.08\paperheight}
 

@@ -13,10 +13,13 @@ If no arguments provided, processes all .pptx files in pptx-input/
 """
 
 import argparse
+import glob
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +31,7 @@ try:
     from pptx.util import Inches, Pt, Emu
     from pptx.enum.shapes import MSO_SHAPE_TYPE, MSO_SHAPE
     from pptx.enum.dml import MSO_THEME_COLOR, MSO_FILL_TYPE
+    from pptx.oxml.ns import qn
 except ImportError:
     print("Error: python-pptx is required. Install with: pip install python-pptx")
     sys.exit(1)
@@ -129,6 +133,8 @@ class PPTXToLatexConverter:
         self.video_dir = Path(video_dir)
         self.image_counter = 0
         self.video_counter = 0
+        self.theme_colors = {}  # scheme key -> (r,g,b), populated from the theme
+        self.raster_map = {}    # slide_num -> rendered figure filename
 
         # Aspect ratio tracking - set during conversion
         self.source_slide_width = None   # EMU
@@ -224,9 +230,9 @@ class PPTXToLatexConverter:
         aspect_scale = self.source_aspect_ratio / self.target_aspect_ratio
 
         if aspect_scale < 1.0:
-            # Source narrower - center content horizontally
-            # Add offset to center the content
-            offset = (0.9 - canvas_width) / 2
+            # Source narrower - center content within the full textwidth so the
+            # letterboxed canvas sits centred (equal margins left and right).
+            offset = (1.0 - canvas_width) / 2
             return offset + rel_x * canvas_width
         else:
             return rel_x * canvas_width
@@ -505,6 +511,74 @@ class PPTXToLatexConverter:
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
+    # PP_PLACEHOLDER / MSO_THEME_COLOR index -> theme color-scheme key.
+    # Uses the default slide-master colour map (bg1->lt1, tx1->dk1, etc.).
+    _THEME_COLOR_MAP = {
+        1: 'dk1', 2: 'lt1', 3: 'dk2', 4: 'lt2',
+        5: 'accent1', 6: 'accent2', 7: 'accent3', 8: 'accent4',
+        9: 'accent5', 10: 'accent6', 11: 'hlink', 12: 'folHlink',
+        13: 'dk1', 14: 'lt1', 15: 'dk2', 16: 'lt2',
+    }
+
+    def _load_theme_colors(self, prs) -> None:
+        """Parse the presentation theme colour scheme into self.theme_colors.
+
+        Maps scheme keys (dk1, lt1, accent1, ...) to (r, g, b) tuples so that
+        theme/scheme-coloured text (e.g. white captions defined as
+        BACKGROUND_1) can be resolved to concrete RGB values.
+        """
+        self.theme_colors = {}
+        try:
+            from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+            master = prs.slide_masters[0]
+            theme_part = master.part.part_related_by(RT.THEME)
+            xml = theme_part.blob.decode('utf-8', errors='ignore')
+            clr = re.search(r'<a:clrScheme.*?</a:clrScheme>', xml, re.S)
+            if not clr:
+                return
+            seg = clr.group(0)
+            for name in ('dk1', 'lt1', 'dk2', 'lt2', 'accent1', 'accent2',
+                         'accent3', 'accent4', 'accent5', 'accent6',
+                         'hlink', 'folHlink'):
+                m = re.search(r'<a:%s>(.*?)</a:%s>' % (name, name), seg, re.S)
+                if not m:
+                    continue
+                body = m.group(1)
+                hexm = (re.search(r'srgbClr val="([0-9A-Fa-f]{6})"', body)
+                        or re.search(r'lastClr="([0-9A-Fa-f]{6})"', body))
+                if hexm:
+                    h = hexm.group(1)
+                    self.theme_colors[name] = (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+        except Exception:
+            pass
+
+    def font_rgb(self, font) -> Optional[tuple]:
+        """Resolve a run/paragraph font colour to an (r, g, b) tuple.
+
+        Handles both explicit RGB colours and theme/scheme colours (resolved
+        through the loaded theme palette). Returns None if no colour is set.
+        """
+        try:
+            color = font.color
+            if color is None or color.type is None:
+                return None
+            try:
+                if color.rgb is not None:
+                    return (color.rgb[0], color.rgb[1], color.rgb[2])
+            except (AttributeError, TypeError):
+                pass
+            try:
+                tc = color.theme_color
+            except Exception:
+                tc = None
+            if tc is not None:
+                key = self._THEME_COLOR_MAP.get(int(tc))
+                if key and key in getattr(self, 'theme_colors', {}):
+                    return self.theme_colors[key]
+        except (AttributeError, TypeError):
+            pass
+        return None
+
     def rgb_to_latex_color(self, rgb_color) -> Optional[str]:
         """Convert python-pptx RGB color to LaTeX color definition."""
         if rgb_color is None:
@@ -600,19 +674,11 @@ class PPTXToLatexConverter:
         except (AttributeError, TypeError):
             pass
 
-        # Font color
+        # Font color (resolves explicit RGB and theme/scheme colors)
         try:
-            rgb = None
-            # Check run-level color
-            if font.color and font.color.type is not None:
-                if font.color.rgb:
-                    rgb = self.rgb_to_latex_color(font.color.rgb)
-                elif font.color.theme_color is not None:
-                    # Theme colors - map common ones
-                    # This is a simplified mapping; actual theme colors depend on the template
-                    pass
-
-            if rgb and rgb != "0,0,0":
+            crgb = self.font_rgb(font)
+            if crgb and crgb != (0, 0, 0):
+                rgb = f"{crgb[0]},{crgb[1]},{crgb[2]}"
                 prefix = f"\\textcolor[RGB]{{{rgb}}}" + "{" + prefix
                 suffix = suffix + "}"
         except (AttributeError, TypeError):
@@ -665,6 +731,24 @@ class PPTXToLatexConverter:
 
         return False
 
+    def _paragraph_has_marker(self, para) -> bool:
+        """Whether a paragraph should show a bullet marker.
+
+        PowerPoint paragraphs can explicitly suppress their bullet (``buNone``)
+        or set one (``buChar``/``buAutoNum``). Returns False only for an explicit
+        ``buNone``; unspecified paragraphs inherit the list style and are treated
+        as bulleted.
+        """
+        try:
+            pPr = para._p.find(qn('a:pPr'))
+            if pPr is None:
+                return True
+            if pPr.find(qn('a:buNone')) is not None:
+                return False
+            return True
+        except Exception:
+            return True
+
     def process_paragraph_with_formatting(self, para, base_font_size: float = 11.0) -> dict:
         """Process a paragraph preserving run-level formatting."""
         formatted_parts = []
@@ -708,7 +792,8 @@ class PPTXToLatexConverter:
             'text': formatted_text,
             'raw_text': ''.join(raw_text_parts),
             'level': level,
-            'is_bullet': para.level is not None and para.level >= 0
+            'is_bullet': para.level is not None and para.level >= 0,
+            'has_marker': self._paragraph_has_marker(para),
         }
 
     def extract_image(self, shape, slide_num: int, slide_width=None, slide_height=None) -> Optional[dict]:
@@ -900,12 +985,10 @@ class PPTXToLatexConverter:
                             result['bold'] = True
                         if font.italic:
                             result['italic'] = True
-                        if font.color and font.color.rgb:
-                            result['color_rgb'] = (
-                                font.color.rgb[0],
-                                font.color.rgb[1],
-                                font.color.rgb[2]
-                            )
+                        if result.get('color_rgb') is None:
+                            crgb = self.font_rgb(font)
+                            if crgb:
+                                result['color_rgb'] = crgb
                         # Use first run's properties
                         if result['size_pt']:
                             break
@@ -954,17 +1037,11 @@ class PPTXToLatexConverter:
                                     font_size_pt = font.size.pt
                                 elif para_font and para_font.size and font_size_pt is None:
                                     font_size_pt = para_font.size.pt
-                                # Get font color (handle theme colors gracefully)
-                                try:
-                                    if font.color and font.color.type is not None and font_color_rgb is None:
-                                        if font.color.rgb:
-                                            font_color_rgb = (
-                                                font.color.rgb[0],
-                                                font.color.rgb[1],
-                                                font.color.rgb[2]
-                                            )
-                                except (AttributeError, TypeError):
-                                    pass
+                                # Get font color (resolves theme/scheme colors too)
+                                if font_color_rgb is None:
+                                    crgb = self.font_rgb(font)
+                                    if crgb:
+                                        font_color_rgb = crgb
 
                         shape_text += self.escape_latex(para.text.strip()) + " "
                 shape_text = shape_text.strip()
@@ -1124,17 +1201,11 @@ class PPTXToLatexConverter:
                                     font_size_pt = font.size.pt
                                 elif para_font and para_font.size and font_size_pt is None:
                                     font_size_pt = para_font.size.pt
-                                # Get font color (handle theme colors gracefully)
-                                try:
-                                    if font.color and font.color.type is not None and font_color_rgb is None:
-                                        if font.color.rgb:
-                                            font_color_rgb = (
-                                                font.color.rgb[0],
-                                                font.color.rgb[1],
-                                                font.color.rgb[2]
-                                            )
-                                except (AttributeError, TypeError):
-                                    pass
+                                # Get font color (resolves theme/scheme colors too)
+                                if font_color_rgb is None:
+                                    crgb = self.font_rgb(font)
+                                    if crgb:
+                                        font_color_rgb = crgb
 
                         shape_text += self.escape_latex(para.text.strip()) + " "
                 shape_text = shape_text.strip()
@@ -1553,12 +1624,10 @@ class PPTXToLatexConverter:
                                     font_size_pt = font.size.pt
                                 elif para_font and para_font.size and font_size_pt is None:
                                     font_size_pt = para_font.size.pt
-                                try:
-                                    if font.color and font.color.type is not None and font_color_rgb is None:
-                                        if font.color.rgb:
-                                            font_color_rgb = (font.color.rgb[0], font.color.rgb[1], font.color.rgb[2])
-                                except (AttributeError, TypeError):
-                                    pass
+                                if font_color_rgb is None:
+                                    crgb = self.font_rgb(font)
+                                    if crgb:
+                                        font_color_rgb = crgb
                         shape_text += self.escape_latex(para.text.strip()) + " "
                 shape_text = shape_text.strip()
 
@@ -1673,9 +1742,35 @@ class PPTXToLatexConverter:
                 continue
 
         # === PASS 2: Process text shapes ===
+        # Body text can live in several separate boxes; collect each as a block
+        # with its slide position so the boxes are emitted top-to-bottom (their
+        # reading order) instead of arbitrary shape order.
+        content_blocks = []  # list of {'top','left','paras'}
+
+        def _add_content_block(shp, paras):
+            if not paras:
+                return
+            try:
+                top = shp.top if shp.top is not None else None
+            except Exception:
+                top = None
+            try:
+                left = shp.left if shp.left is not None else None
+            except Exception:
+                left = None
+            content_blocks.append({'top': top, 'left': left, 'paras': paras})
+
         for shape in text_shapes_to_process:
             try:
                 shape_type = shape.shape_type
+
+                # Skip slide furniture placeholders (footer, header, slide number,
+                # date). These are rendered by the beamer theme, not the body.
+                try:
+                    if shape.is_placeholder and shape.placeholder_format.type in (13, 14, 15, 16):
+                        continue
+                except (ValueError, AttributeError):
+                    pass
 
                 # Handle text frames
                 if hasattr(shape, 'text_frame') and shape.text and shape.text.strip():
@@ -1685,20 +1780,25 @@ class PPTXToLatexConverter:
                     try:
                         if shape.is_placeholder:
                             ph_type = shape.placeholder_format.type
+                            # python-pptx PP_PLACEHOLDER values:
+                            #   1=TITLE, 2=BODY, 3=CENTER_TITLE, 4=SUBTITLE,
+                            #   6=VERTICAL_BODY, 7=OBJECT
                             # Title placeholder
-                            if ph_type in [1, 3] and not title_found:  # TITLE or CENTER_TITLE
+                            if ph_type in (1, 3) and not title_found:  # TITLE / CENTER_TITLE
                                 result['title'] = self.clean_text(shape.text)
                                 title_found = True
                                 is_placeholder_handled = True
-                            # Subtitle placeholder (type 2)
-                            elif ph_type == 2 and not subtitle_found:
+                            # Subtitle placeholder. Only treat short text as a real
+                            # subtitle; long text in a SUBTITLE placeholder is body
+                            # content (e.g. quote/disclaimer slides).
+                            elif ph_type == 4 and not subtitle_found and len(shape.text.strip()) <= 80:
                                 result['subtitle'] = self.clean_text(shape.text)
                                 subtitle_found = True
                                 is_placeholder_handled = True
                             # Body/Content placeholder - process as content (bullet points)
-                            elif ph_type in [6, 7]:  # BODY, OBJECT
+                            elif ph_type in (2, 4, 6, 7):  # BODY, SUBTITLE(long), VERTICAL_BODY, OBJECT
                                 paragraphs = self.process_text_frame(shape.text_frame)
-                                result['content_items'].extend(paragraphs)
+                                _add_content_block(shape, paragraphs)
                                 is_placeholder_handled = True
                                 is_body_placeholder = True
                     except (ValueError, AttributeError):
@@ -1731,7 +1831,7 @@ class PPTXToLatexConverter:
                         if is_substantial_content:
                             # Treat as body content (bullet points)
                             paragraphs = self.process_text_frame(shape.text_frame)
-                            result['content_items'].extend(paragraphs)
+                            _add_content_block(shape, paragraphs)
                         else:
                             # Treat as positioned element
                             elem = self.extract_positioned_element(shape, slide_width, slide_height)
@@ -1748,6 +1848,16 @@ class PPTXToLatexConverter:
             except Exception as e:
                 print(f"Warning: Could not process shape in pass 2: {e}")
                 continue
+
+        # Emit body blocks in reading order (top-to-bottom, then left-to-right).
+        # Blocks without a known position keep their collection order at the end.
+        _BIG = 1 << 62
+        for block in sorted(
+            content_blocks,
+            key=lambda b: (b['top'] if b['top'] is not None else _BIG,
+                           b['left'] if b['left'] is not None else _BIG)
+        ):
+            result['content_items'].extend(block['paras'])
 
         # Determine if we need unified TikZ rendering
         # Criteria: multiple images OR (images + positioned elements)
@@ -1774,6 +1884,119 @@ class PPTXToLatexConverter:
                 return True
 
         return False
+
+    def is_section_divider(self, slide) -> bool:
+        """Detect a chapter/section divider slide.
+
+        PowerPoint marks these with the ``secHead`` slide layout type
+        (the "Section Header" / "Kapitel" layout). These slides define the
+        real section structure of the deck and must drive ``\\section`` rather
+        than every individual slide title.
+        """
+        try:
+            layout = slide.slide_layout
+            if layout.element.get('type') == 'secHead':
+                return True
+            name = (layout.name or '').lower()
+            return any(k in name for k in ('kapitel', 'section header', 'abschnitt'))
+        except Exception:
+            return False
+
+    # A slide with at least this many freeform (vector) shapes is treated as
+    # non-reproducible vector art and rendered to an image instead.
+    RASTER_FREEFORM_THRESHOLD = 15
+
+    def _count_freeforms(self, shapes) -> int:
+        """Recursively count freeform (vector) shapes, descending into groups."""
+        count = 0
+        for shape in shapes:
+            try:
+                if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    count += self._count_freeforms(shape.shapes)
+                elif shape.shape_type == MSO_SHAPE_TYPE.FREEFORM:
+                    count += 1
+            except Exception:
+                continue
+        return count
+
+    def slide_needs_raster(self, slide) -> bool:
+        """True if a slide is dominated by non-reproducible vector graphics."""
+        try:
+            return self._count_freeforms(slide.shapes) >= self.RASTER_FREEFORM_THRESHOLD
+        except Exception:
+            return False
+
+    def _rasterize_slides(self, slide_numbers) -> dict:
+        """Render given 1-based slide numbers to images via LibreOffice.
+
+        The whole presentation is converted to PDF once, then the requested
+        pages are extracted as high-resolution JPGs into the figure directory.
+        Returns a mapping {slide_number: figure_filename}.
+        """
+        result = {}
+        slide_numbers = sorted(set(slide_numbers))
+        if not slide_numbers:
+            return result
+
+        soffice = shutil.which('libreoffice') or shutil.which('soffice')
+        pdftoppm = shutil.which('pdftoppm')
+        if not soffice or not pdftoppm:
+            print("  Warning: LibreOffice/pdftoppm not found - cannot rasterize "
+                  f"{len(slide_numbers)} vector-graphics slide(s)")
+            return result
+
+        tmp = tempfile.mkdtemp(prefix='pptx2tex_raster_')
+        try:
+            print(f"  Rasterizing {len(slide_numbers)} vector-graphics slide(s) via LibreOffice...")
+            subprocess.run(
+                [soffice, '--headless', '--convert-to', 'pdf', '--outdir', tmp, str(self.input_path)],
+                check=True, capture_output=True, timeout=600
+            )
+            pdfs = glob.glob(os.path.join(tmp, '*.pdf'))
+            if not pdfs:
+                print("  Warning: LibreOffice produced no PDF; skipping rasterization")
+                return result
+            pdf = pdfs[0]
+            try:
+                from PIL import Image
+            except ImportError:
+                Image = None
+            for n in slide_numbers:
+                prefix = os.path.join(tmp, f'render{n}')
+                subprocess.run(
+                    [pdftoppm, '-png', '-r', '200', '-f', str(n), '-l', str(n), pdf, prefix],
+                    check=True, capture_output=True, timeout=180
+                )
+                pages = glob.glob(prefix + '*.png')
+                if not pages:
+                    continue
+                fname = f"slide{n:02d}_render.jpg"
+                dest = self.fig_dir / fname
+                if Image is not None:
+                    Image.open(pages[0]).convert('RGB').save(dest, 'JPEG', quality=90, dpi=(220, 220))
+                else:
+                    shutil.copy2(pages[0], self.fig_dir / f"slide{n:02d}_render.png")
+                    fname = f"slide{n:02d}_render.png"
+                result[n] = fname
+        except Exception as e:
+            print(f"  Warning: rasterization failed: {e}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return result
+
+    def get_slide_title(self, slide) -> str:
+        """Return the cleaned title-placeholder text of a slide, if any."""
+        for shape in slide.shapes:
+            try:
+                if (shape.is_placeholder
+                        and shape.placeholder_format.type in (1, 3)
+                        and shape.has_text_frame):
+                    text = self.clean_text(shape.text)
+                    if text:
+                        return text
+            except (ValueError, AttributeError):
+                continue
+        return ""
 
     def is_thank_you_slide(self, slide) -> bool:
         """Detect if slide is likely a thank-you slide."""
@@ -2311,10 +2534,14 @@ class PPTXToLatexConverter:
         positioned_elements = content['positioned_elements']
         needs_unified_tikz = content['needs_unified_tikz']
 
-        # If no title found, try to use first content as title
+        # If no title found, try to use first content as title -- but only if it
+        # is short enough to be a heading. Long first lines (quotes, disclaimers)
+        # are real body content and must not become a title/section name.
         if not title and content_items:
-            title = content_items[0].get('raw_text', content_items[0]['text'])
-            content_items = content_items[1:]
+            candidate = content_items[0].get('raw_text', content_items[0]['text'])
+            if len(self.clean_text(candidate)) <= 60:
+                title = candidate
+                content_items = content_items[1:]
 
         # Extract sources from content items and from content dict
         content_items, sources = self.extract_sources_from_content(content_items)
@@ -2356,7 +2583,11 @@ class PPTXToLatexConverter:
                         lines.append("  " * current_level + "\\end{itemize}")
                         current_level -= 1
 
-                    lines.append("  " * (level + 1) + f"\\item {text}")
+                    # Respect PowerPoint's per-paragraph bullet suppression
+                    # (buNone): emit an empty label so the line is indented but
+                    # shows no marker.
+                    marker = "\\item " if item.get('has_marker', True) else "\\item[] "
+                    lines.append("  " * (level + 1) + marker + text)
 
                 while current_level > 0:
                     lines.append("  " * current_level + "\\end{itemize}")
@@ -2437,6 +2668,8 @@ class PPTXToLatexConverter:
         lines.append("")
 
         return {
+            'title': title if title else "",
+            'subtitle': subtitle if subtitle else "",
             'section': title if title else "Slide",
             'subsection': subtitle if subtitle else "",
             'latex': '\n'.join(lines)
@@ -2470,6 +2703,9 @@ class PPTXToLatexConverter:
                 shutil.rmtree(temp_dir_to_cleanup, ignore_errors=True)
             raise
 
+        # Load theme colours so scheme-coloured text resolves to RGB
+        self._load_theme_colors(prs)
+
         # Get slide dimensions for image sizing
         slide_width = prs.slide_width
         slide_height = prs.slide_height
@@ -2488,11 +2724,31 @@ class PPTXToLatexConverter:
             if self.is_title_slide(first_slide, 0):
                 title_info.update(self.extract_title_info(first_slide))
 
+        # Identify slides dominated by non-reproducible vector graphics and
+        # render them to images up front (one LibreOffice pass for all of them).
+        raster_targets = []
+        for i, slide in enumerate(prs.slides):
+            if i == 0 and self.is_title_slide(slide, i):
+                continue
+            if self.is_section_divider(slide) or self.is_thank_you_slide(slide):
+                continue
+            if self.slide_needs_raster(slide):
+                raster_targets.append(i + 1)
+        self.raster_map = self._rasterize_slides(raster_targets)
+
         # Process each slide and organize by section
+        #
+        # Section structure is driven by PowerPoint's section-divider slides
+        # (the ``secHead`` layout), NOT by every individual slide title. Each
+        # divider opens a new \section; the slides that follow it become frames
+        # whose own title is emitted as a \subsection. Slides that appear before
+        # the first divider ("front matter") fall back to using their title as
+        # the section name so the table of contents still has structure.
         sections = []  # List of {'name': section_name, 'filename': safe_filename, 'content': [lines]}
         current_section = None
         current_section_data = None
         current_subsection = None
+        current_chapter = None  # Title of the most recent section-divider slide
         thank_you_info = None
 
         for i, slide in enumerate(prs.slides):
@@ -2514,11 +2770,51 @@ class PPTXToLatexConverter:
                 thank_you_info = {'text': thank_text}
                 continue
 
-            # Get slide content with section/subsection info
-            slide_data = self.slide_to_latex(slide, slide_num, slide_width, slide_height)
-            section = slide_data['section']
-            subsection = slide_data['subsection']
-            frame_latex = slide_data['latex']
+            # Section-divider slide: open a new chapter/section. The theme draws
+            # the divider page automatically via \AtBeginSection, so we do not
+            # render the slide body itself.
+            if self.is_section_divider(slide):
+                chapter = self.get_slide_title(slide) or (slide.slide_layout.name or "Section")
+                current_chapter = chapter
+                print(f"  Slide {slide_num}: section divider -> '{chapter}'")
+                continue
+
+            # Vector-graphics slide: embed the LibreOffice-rendered image as a
+            # full-bleed plain frame (it already contains the slide's own title
+            # and footer, so we drop the beamer frame furniture).
+            if slide_num in self.raster_map:
+                slide_title = self.get_slide_title(slide)
+                slide_subtitle = ""
+                fname = self.raster_map[slide_num]
+                frame_latex = (
+                    "{\n"
+                    "\\setbeamertemplate{background}{}\n"  # drop the theme logo/background
+                    "\\begin{frame}[plain]\n"
+                    "\\centering\n"
+                    f"\\includegraphics[width=\\paperwidth,height=\\paperheight,keepaspectratio]{{fig/{fname}}}\n"
+                    "\\end{frame}\n"
+                    "}"
+                )
+            else:
+                # Get slide content (title/subtitle + body LaTeX)
+                slide_data = self.slide_to_latex(slide, slide_num, slide_width, slide_height)
+                slide_title = slide_data['title']
+                slide_subtitle = slide_data['subtitle']
+                frame_latex = slide_data['latex']
+
+            # Decide section/subsection placement.
+            if current_chapter is not None:
+                # Inside a real chapter: the chapter is the section, the slide's
+                # own title is the subsection.
+                section = current_chapter
+                subsection = slide_title
+            else:
+                # Front matter (no divider seen yet): keep the old title-based
+                # grouping so these slides still land under sensible sections.
+                # Title-less slides stay with the current group instead of
+                # spawning a stray section.
+                section = slide_title if slide_title else (current_section or "Slide")
+                subsection = slide_subtitle
 
             # Check if we need to start a new section
             if section != current_section:
