@@ -126,13 +126,18 @@ class PPTXToLatexConverter:
     BEAMER_169_TEXTHEIGHT_CM = 8.0   # Usable text height (excluding header/footer)
 
     def __init__(self, input_path: str, output_path: str,
-                 fig_dir: str = "fig", video_dir: str = "videos"):
+                 fig_dir: str = "fig", video_dir: str = "videos",
+                 output_root: Optional[str] = None):
         self.input_path = Path(input_path)
         self.output_path = Path(output_path)
+        # parent folder of the per-presentation output folder (None: tex-output/
+        # next to this script, the historical default)
+        self.output_root = Path(output_root) if output_root else None
         self.fig_dir = Path(fig_dir)
         self.video_dir = Path(video_dir)
         self.image_counter = 0
         self.video_counter = 0
+        self.video_posters = {}  # video filename -> poster-frame filename
         self.theme_colors = {}  # scheme key -> (r,g,b), populated from the theme
         self.raster_map = {}    # slide_num -> rendered figure filename
 
@@ -276,6 +281,10 @@ class PPTXToLatexConverter:
         if not text:
             return ""
 
+        # PowerPoint soft line breaks (Shift+Enter) arrive as vertical tabs
+        # (U+000B), which no LaTeX engine accepts: use a plain space
+        text = text.replace('\x0b', ' ')
+
         # Order matters - escape backslash first
         replacements = [
             ('\\', r'\textbackslash{}'),
@@ -293,10 +302,42 @@ class PPTXToLatexConverter:
         for old, new in replacements:
             text = text.replace(old, new)
 
+        # Symbol-font characters (Wingdings, Symbol) arrive as private-use code
+        # points U+F0xx that no LaTeX font knows (pdfLaTeX stops with "Unicode
+        # character not set up"): map the common ones, drop the others
+        text = self._map_symbol_font_chars(text)
+
         # Convert math symbols after escaping special characters
         text = self.convert_math_symbols(text)
 
         return text
+
+    # Private-use code points of PowerPoint symbol fonts -> Unicode (converted to
+    # LaTeX by convert_math_symbols) or directly to LaTeX. Arrows win where
+    # Wingdings and Symbol disagree: they are by far the most frequent use.
+    SYMBOL_FONT_CHARS = {
+        0xF0E0: '→', 0xF0E8: '→', 0xF0F0: '→', 0xF0D8: '→', 0xF0E2: '→', 0xF0AE: '→',
+        0xF0DE: '⇒', 0xF0DF: '⇐', 0xF0AC: '←', 0xF0E7: '←',
+        0xF0B3: '≥', 0xF0A3: '≤', 0xF0B1: '±', 0xF0B4: '×', 0xF0BB: '≈', 0xF0B9: '≠',
+        0xF0A7: r'\textbullet{}', 0xF0B7: r'\textbullet{}', 0xF06C: r'\textbullet{}',
+        0xF06E: r'$\blacksquare$', 0xF0FC: r'$\checkmark$', 0xF0FB: r'$\times$',
+    }
+
+    def _map_symbol_font_chars(self, text: str) -> str:
+        """Replace private-use symbol-font characters (U+E000-U+F8FF)."""
+        if not any(0xE000 <= ord(c) <= 0xF8FF for c in text):
+            return text
+        out = []
+        for c in text:
+            cp = ord(c)
+            if 0xE000 <= cp <= 0xF8FF:
+                if cp in self.SYMBOL_FONT_CHARS:
+                    out.append(self.SYMBOL_FONT_CHARS[cp])
+                else:
+                    print(f"  Warning: dropped symbol-font character U+{cp:04X} (no LaTeX equivalent known)")
+            else:
+                out.append(c)
+        return ''.join(out)
 
     def convert_math_symbols(self, text: str) -> str:
         """Convert mathematical symbols to LaTeX math mode equivalents."""
@@ -507,7 +548,8 @@ class PPTXToLatexConverter:
         """Clean and normalize text from PPTX."""
         if not text:
             return ""
-        # Remove excessive whitespace
+        # Remove excessive whitespace (\s also covers the vertical tab U+000B
+        # that PowerPoint uses for soft line breaks)
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
@@ -796,21 +838,143 @@ class PPTXToLatexConverter:
             'has_marker': self._paragraph_has_marker(para),
         }
 
+    # Vector/metafile formats that Pillow cannot rasterize on Linux/macOS
+    EXTERNAL_RASTER_EXTS = ('emf', 'wmf', 'svg')
+
+    def _rasterize_external(self, blob: bytes, ext: str, dpi: int = 220):
+        """Rasterize EMF/WMF/SVG data that Pillow cannot load (returns a PIL image or None).
+
+        Inkscape renders metafiles cropped to their content; LibreOffice is used
+        as a fallback for EMF/WMF (it places the drawing on a page, so the result
+        is trimmed to its non-white bounding box).
+        """
+        if not HAS_PIL:
+            return None
+        tmp = tempfile.mkdtemp(prefix='pptx2tex_img_')
+        try:
+            src = os.path.join(tmp, f'src.{ext}')
+            with open(src, 'wb') as f:
+                f.write(blob)
+            inkscape = shutil.which('inkscape')
+            if inkscape:
+                out = os.path.join(tmp, 'out.png')
+                try:
+                    subprocess.run([inkscape, src, '--export-type=png', f'--export-filename={out}',
+                                    f'--export-dpi={dpi}'], check=True, capture_output=True, timeout=300)
+                    if os.path.exists(out):
+                        return Image.open(out).copy()
+                except Exception as e:
+                    print(f"  Warning: Inkscape could not convert .{ext} image: {e}")
+            soffice = shutil.which('libreoffice') or shutil.which('soffice')
+            if soffice and ext in ('emf', 'wmf'):
+                try:
+                    subprocess.run([soffice, '--headless', '--convert-to', 'png', '--outdir', tmp, src],
+                                   check=True, capture_output=True, timeout=300)
+                    out = os.path.join(tmp, 'src.png')
+                    if os.path.exists(out):
+                        img = Image.open(out).convert('RGB')
+                        # trim the white page around the drawing
+                        from PIL import ImageChops
+                        bg = Image.new('RGB', img.size, (255, 255, 255))
+                        bbox = ImageChops.difference(img, bg).getbbox()
+                        return img.crop(bbox) if bbox else img
+                except Exception as e:
+                    print(f"  Warning: LibreOffice could not convert .{ext} image: {e}")
+            return None
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _picture_blob(self, shape):
+        """Return (blob, ext) of a picture shape, including SVG-only pictures.
+
+        Office icons are stored as an SVG (asvg:svgBlip) without a raster
+        r:embed fallback; python-pptx then raises 'no embedded image'.
+        """
+        try:
+            image = shape.image
+            return image.blob, (image.ext or '').lower()
+        except Exception:
+            pass
+        try:
+            svg_ids = shape._element.xpath('.//asvg:svgBlip/@r:embed') if hasattr(shape, '_element') else []
+        except Exception:
+            # namespace prefixes not registered: fall back to a regex on the XML
+            svg_ids = re.findall(r'svgBlip[^>]*r:embed="([^"]+)"', shape._element.xml)
+        for rid in svg_ids:
+            try:
+                return shape.part.related_part(rid).blob, 'svg'
+            except Exception:
+                continue
+        return None, None
+
+    # Output resolution of extracted images (long side, pixels) and JPG quality
+    MAX_IMAGE_PX = 2000
+    JPEG_QUALITY = 90
+
+    @staticmethod
+    def _quarter_turn(shape) -> bool:
+        """True if the shape is rotated by about 90 or 270 degrees."""
+        try:
+            return round((shape.rotation or 0) / 90) % 2 == 1
+        except Exception:
+            return False
+
+    def _apply_shape_transform(self, img, shape):
+        """Rotate/mirror an extracted picture as it is shown on the slide.
+
+        PowerPoint stores the original image and applies <a:xfrm rot=... flipH/flipV>
+        when drawing it; python-pptx returns the untransformed blob.
+        """
+        try:
+            from PIL import ImageOps
+            xfrm = shape._element.xpath('./p:spPr/a:xfrm')
+            if xfrm:
+                if xfrm[0].get('flipH') in ('1', 'true'):
+                    img = ImageOps.mirror(img)
+                if xfrm[0].get('flipV') in ('1', 'true'):
+                    img = ImageOps.flip(img)
+            angle = (getattr(shape, 'rotation', 0) or 0) % 360
+            if angle:
+                # PowerPoint angles are clockwise, PIL's are counter-clockwise
+                fill = (255, 255, 255, 0) if img.mode == 'RGBA' else 'white'
+                if img.mode not in ('RGB', 'RGBA', 'L'):
+                    img = img.convert('RGBA'); fill = (255, 255, 255, 0)
+                img = img.rotate(-angle, expand=True, fillcolor=fill)
+        except Exception as e:
+            print(f"  Warning: could not apply rotation/flip of '{getattr(shape, 'name', '')}': {e}")
+        return img
+
     def extract_image(self, shape, slide_num: int, slide_width=None, slide_height=None) -> Optional[dict]:
         """Extract image from shape, convert to high-resolution JPG (220 dpi), and save to fig directory.
 
+        EMF/WMF metafiles and SVG-only pictures (Office icons) are rasterized
+        with Inkscape (or LibreOffice) because Pillow cannot render them.
         Returns dict with 'filename', 'width_ratio', and bounding box info for overlay detection.
         """
         try:
-            if hasattr(shape, 'image'):
-                image = shape.image
+            blob, ext = self._picture_blob(shape)
+            if blob is not None:
                 self.image_counter += 1
                 filename = f"slide{slide_num:02d}_img{self.image_counter:03d}.jpg"
                 filepath = self.fig_dir / filename
 
                 if HAS_PIL:
                     # Convert to JPG at 220 dpi
-                    img = Image.open(io.BytesIO(image.blob))
+                    try:
+                        img = Image.open(io.BytesIO(blob))
+                        img.load()
+                    except Exception:
+                        img = self._rasterize_external(blob, ext) if ext in self.EXTERNAL_RASTER_EXTS else None
+                        if img is None:
+                            raise ValueError(f"cannot rasterize .{ext} image")
+                    # Apply the picture's own rotation/flip from PowerPoint: the
+                    # stored image is unrotated (a plan turned by 90 deg on the
+                    # slide would otherwise be extracted sideways)
+                    img = self._apply_shape_transform(img, shape)
+                    # Cap the resolution: slides never need more, and full-size
+                    # photos at quality 95 bloat the output (and its repository)
+                    if max(img.size) > self.MAX_IMAGE_PX:
+                        img.thumbnail((self.MAX_IMAGE_PX, self.MAX_IMAGE_PX), Image.LANCZOS)
                     # Convert to RGB if necessary (e.g., PNG with transparency)
                     if img.mode in ('RGBA', 'LA', 'P'):
                         # Create white background for transparent images
@@ -822,19 +986,23 @@ class PPTXToLatexConverter:
                     elif img.mode != 'RGB':
                         img = img.convert('RGB')
                     # Save as JPG with 220 dpi
-                    img.save(filepath, 'JPEG', quality=95, dpi=(220, 220))
+                    img.save(filepath, 'JPEG', quality=self.JPEG_QUALITY, dpi=(220, 220),
+                             optimize=True)
                 else:
                     # Fallback: save original format if PIL not available
-                    ext = image.ext
                     filename = f"slide{slide_num:02d}_img{self.image_counter:03d}.{ext}"
                     filepath = self.fig_dir / filename
                     with open(filepath, 'wb') as f:
-                        f.write(image.blob)
+                        f.write(blob)
 
-                # Calculate width ratio relative to slide
+                # Calculate width ratio relative to slide (a picture turned by
+                # 90/270 deg shows its frame height as width)
                 width_ratio = 0.8  # Default
-                if slide_width and hasattr(shape, 'width') and shape.width:
-                    width_ratio = min(0.95, shape.width / slide_width)
+                shown_width = shape.width if hasattr(shape, 'width') else None
+                if self._quarter_turn(shape) and getattr(shape, 'height', None):
+                    shown_width = shape.height
+                if slide_width and shown_width:
+                    width_ratio = min(0.95, shown_width / slide_width)
                     # Round to reasonable precision
                     width_ratio = round(width_ratio, 2)
 
@@ -851,29 +1019,92 @@ class PPTXToLatexConverter:
             print(f"Warning: Could not extract image: {e}")
         return None
 
-    def extract_video(self, shape, slide_num: int) -> Optional[str]:
-        """Extract video from shape and save to videos directory."""
+    @staticmethod
+    def is_video_shape(shape) -> bool:
+        """True for any shape carrying a video, including video placeholders.
+
+        A video inserted into a content placeholder reports shape_type
+        PLACEHOLDER, not MEDIA, so the XML is checked instead.
+        """
         try:
             if shape.shape_type == MSO_SHAPE_TYPE.MEDIA:
-                # Access the media part
-                if hasattr(shape, '_element'):
-                    # Try to get video from the shape's media
-                    for rel in shape.part.rels.values():
-                        if "video" in rel.reltype.lower():
-                            self.video_counter += 1
-                            # Determine extension from content type
-                            content_type = getattr(rel.target_part, 'content_type', 'video/mp4')
-                            ext = content_type.split('/')[-1] if '/' in content_type else 'mp4'
-                            filename = f"slide{slide_num:02d}_vid{self.video_counter:03d}.{ext}"
-                            filepath = self.video_dir / filename
+                return True
+            xml = shape._element.xml
+            return 'videoFile' in xml or 'p14:media' in xml
+        except Exception:
+            return False
 
-                            with open(filepath, 'wb') as f:
-                                f.write(rel.target_part.blob)
+    def extract_video(self, shape, slide_num: int) -> Optional[str]:
+        """Extract the video of *this* shape (and its poster frame) to the videos directory.
 
-                            return filename
+        The media part is resolved through the shape's own relationship ids
+        (p14:media r:embed, else a:videoFile r:link). Iterating over all slide
+        relationships would return the first video of the slide for every
+        video shape. The poster frame (the shape's blip) is saved as
+        <video>-poster.jpg and remembered in self.video_posters.
+        """
+        try:
+            if not self.is_video_shape(shape):
+                return None
+            xml = shape._element.xml
+            rids = re.findall(r'<p14:media[^>]*r:embed="([^"]+)"', xml) + \
+                re.findall(r'<a:videoFile[^>]*r:link="([^"]+)"', xml)
+            part = None
+            for rid in rids:
+                try:
+                    part = shape.part.related_part(rid)
+                    break
+                except Exception:
+                    continue  # external (linked, not embedded) video
+            if part is None:
+                print(f"Warning: slide {slide_num}: video is linked, not embedded - skipped")
+                return None
+            self.video_counter += 1
+            content_type = getattr(part, 'content_type', 'video/mp4')
+            ext = content_type.split('/')[-1] if '/' in content_type else 'mp4'
+            ext = {'quicktime': 'mov', 'x-msvideo': 'avi', 'x-ms-wmv': 'wmv', 'mpeg': 'mpg'}.get(ext, ext)
+            filename = f"slide{slide_num:02d}_vid{self.video_counter:03d}.{ext}"
+            with open(self.video_dir / filename, 'wb') as f:
+                f.write(part.blob)
+
+            # poster frame = the picture shown before playback
+            poster_ids = re.findall(r'<a:blip[^>]*r:embed="([^"]+)"', xml)
+            if poster_ids and HAS_PIL:
+                try:
+                    blob = shape.part.related_part(poster_ids[0]).blob
+                    img = Image.open(io.BytesIO(blob)).convert('RGB')
+                    poster = f"{Path(filename).stem}-poster.jpg"
+                    img.save(self.video_dir / poster, 'JPEG', quality=90)
+                    self.video_posters[filename] = poster
+                except Exception as e:
+                    print(f"Warning: slide {slide_num}: could not save video poster: {e}")
+            return filename
         except Exception as e:
             print(f"Warning: Could not extract video: {e}")
         return None
+
+    def table_to_latex(self, table) -> str:
+        """Convert a PowerPoint table to a LaTeX tabular with proportional p-columns."""
+        try:
+            widths = [col.width or 0 for col in table.columns]
+            total = float(sum(widths)) or 1.0
+            spec = ''.join(f"p{{{max(0.04, 0.95 * w / total):.2f}\\textwidth}}" for w in widths)
+            rows = []
+            for r_idx, row in enumerate(table.rows):
+                cells = []
+                for cell in row.cells:
+                    paras = [self.process_paragraph_with_formatting(p)['text'] for p in cell.text_frame.paragraphs]
+                    text = r' \newline '.join(t for t in paras if t.strip())
+                    if r_idx == 0:
+                        text = f"\\textbf{{{text}}}" if text else text
+                    cells.append(text)
+                rows.append(' & '.join(cells) + r' \\ \hline')
+            size = r'\footnotesize' if len(rows) > 8 else r'\small'
+            return '\n'.join([f'{{{size}', f'\\begin{{tabular}}{{{spec}}}', r'\hline'] + rows +
+                             [r'\end{tabular}}'])
+        except Exception as e:
+            print(f"Warning: Could not convert table: {e}")
+            return ''
 
     def process_text_frame(self, text_frame, base_font_size: float = 11.0) -> list:
         """Process text frame and return list of paragraphs with formatting info."""
@@ -1685,6 +1916,7 @@ class PPTXToLatexConverter:
             'content_items': [],
             'images': [],
             'videos': [],
+            'tables': [],  # LaTeX tabular strings, in reading order
             'positioned_elements': []  # New: stores all positioned shapes
         }
 
@@ -1712,8 +1944,25 @@ class PPTXToLatexConverter:
                             text_shapes_to_process.append(child_shape)
                     continue
 
-                # Check for image in ANY shape that has an 'image' attribute
-                if hasattr(shape, 'image') and shape.image is not None:
+                # Videos first: a video placeholder also exposes its poster as
+                # an 'image' and would otherwise be taken for a picture
+                if self.is_video_shape(shape):
+                    vid_file = self.extract_video(shape, slide_num)
+                    if vid_file:
+                        result['videos'].append(vid_file)
+                    continue
+
+                # Tables (graphic frames) carry no text_frame of their own
+                if getattr(shape, 'has_table', False) and shape.has_table:
+                    tab = self.table_to_latex(shape.table)
+                    if tab:
+                        result['tables'].append(tab)
+                    continue
+
+                # Check for image in ANY shape that carries picture data. (hasattr()
+                # is not safe here: the .image property raises ValueError, not
+                # AttributeError, for SVG-only pictures.)
+                if self._picture_blob(shape)[0] is not None:
                     img_info = self.extract_image(shape, slide_num, slide_width, slide_height)
                     if img_info:
                         result['images'].append(img_info)
@@ -1901,6 +2150,35 @@ class PPTXToLatexConverter:
             return any(k in name for k in ('kapitel', 'section header', 'abschnitt'))
         except Exception:
             return False
+
+    def _has_visual_content(self, shapes) -> bool:
+        """True if the shapes contain pictures, videos, tables or charts (groups included)."""
+        for shape in shapes:
+            try:
+                if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    if self._has_visual_content(shape.shapes):
+                        return True
+                    continue
+                if self.is_video_shape(shape):
+                    return True
+                if getattr(shape, 'has_table', False) and shape.has_table:
+                    return True
+                if getattr(shape, 'has_chart', False) and shape.has_chart:
+                    return True
+                if self._picture_blob(shape)[0] is not None:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def is_pure_section_divider(self, slide) -> bool:
+        """A section-header slide that only carries text (title, list of topics).
+
+        Decks sometimes reuse the section-header layout for ordinary content
+        slides (e.g. a title plus photos). Those must be rendered as frames,
+        otherwise their pictures are silently dropped.
+        """
+        return self.is_section_divider(slide) and not self._has_visual_content(slide.shapes)
 
     # A slide with at least this many freeform (vector) shapes is treated as
     # non-reproducible vector art and rendered to an image instead.
@@ -2565,8 +2843,15 @@ class PPTXToLatexConverter:
                 strip_font_sizes = density['is_text_heavy']
                 lines.append("\\begin{itemize}")
                 current_level = 0
+                # Boxes whose paragraphs all sit at indent level >= 1 (or that
+                # jump by two levels) would open a nested itemize without an
+                # \\item ("Something's wrong--perhaps a missing \\item"):
+                # shift to the shallowest level and allow one step at a time.
+                min_level = min(it.get('level', 0) for it in content_items)
+                prev_level = -1
                 for item in content_items:
-                    level = item.get('level', 0)
+                    level = min(item.get('level', 0) - min_level, prev_level + 1)
+                    prev_level = level
                     text = item['text']
 
                     if strip_font_sizes:
@@ -2648,16 +2933,29 @@ class PPTXToLatexConverter:
             lines.append("\\end{tikzpicture}")
             lines.append("\\end{center}")
 
-        # Add videos
+        # Add tables (converted PowerPoint tables)
+        for tab in content.get('tables', []):
+            lines.append("\\begin{center}")
+            lines.append(tab)
+            lines.append("\\end{center}")
+
+        # Add videos (with their own poster frame when available). \\pptxvideo
+        # (theme) links the poster to the clip with a relative Launch action:
+        # works in Acrobat on Windows/macOS, SumatraPDF, Okular and pdfpc, unlike
+        # movie15, which needs pdfLaTeX and Acrobat's legacy multimedia.
         for vid in videos:
-            lines.append(f"% Video: {vid}")
-            lines.append("\\includemovie[")
-            lines.append("    inline=false,")
-            lines.append("    attach=false,")
-            lines.append("    autoplay,")
-            lines.append(f"    text={{\\includegraphics[width=0.9\\textwidth,height={max_image_height}\\textheight,keepaspectratio]{{videos/generic-thumbnail.jpg}}}}")
-            vid_path = "videos/" + vid
-            lines.append(f"]{{0.9\\textwidth}}{{{max_image_height}\\textheight}}{{{vid_path}}}")
+            poster = self.video_posters.get(vid, 'generic-thumbnail.jpg')
+            lines.append(f"% Video: {vid} (keep the videos/ folder next to the PDF)")
+            lines.append(f"\\begin{{center}}\\pptxvideo[0.9\\textwidth]{{videos/{vid}}}{{videos/{poster}}}\\end{{center}}")
+
+        # PowerPoint equations (OMML) are not converted: flag them so they are not lost silently
+        try:
+            n_math = slide._element.xml.count('<m:oMath>') + slide._element.xml.count('<m:oMath ')
+        except Exception:
+            n_math = 0
+        if n_math:
+            lines.append(f"% TODO: slide {slide_num} contains {n_math} PowerPoint equation(s) (OMML) "
+                         "that were not converted - retype them in LaTeX")
 
         # Add source command if sources were found
         if sources:
@@ -2730,7 +3028,7 @@ class PPTXToLatexConverter:
         for i, slide in enumerate(prs.slides):
             if i == 0 and self.is_title_slide(slide, i):
                 continue
-            if self.is_section_divider(slide) or self.is_thank_you_slide(slide):
+            if self.is_pure_section_divider(slide) or self.is_thank_you_slide(slide):
                 continue
             if self.slide_needs_raster(slide):
                 raster_targets.append(i + 1)
@@ -2772,8 +3070,10 @@ class PPTXToLatexConverter:
 
             # Section-divider slide: open a new chapter/section. The theme draws
             # the divider page automatically via \AtBeginSection, so we do not
-            # render the slide body itself.
-            if self.is_section_divider(slide):
+            # render the slide body itself. Section-header slides that carry
+            # pictures, videos, tables or charts are content slides and fall
+            # through to the normal frame conversion below.
+            if self.is_pure_section_divider(slide):
                 chapter = self.get_slide_title(slide) or (slide.slide_layout.name or "Section")
                 current_chapter = chapter
                 print(f"  Slide {slide_num}: section divider -> '{chapter}'")
@@ -2866,10 +3166,11 @@ class PPTXToLatexConverter:
         # Get presentation name without extension
         pptx_name = self.input_path.stem
 
-        # Create output in tex-output subfolder (relative to script location)
+        # Create output in tex-output subfolder (relative to script location),
+        # unless --output-dir points elsewhere (keeps this repository clean)
         script_dir = Path(__file__).parent
-        tex_output_dir = script_dir / 'tex-output'
-        tex_output_dir.mkdir(exist_ok=True)
+        tex_output_dir = self.output_root if self.output_root else script_dir / 'tex-output'
+        tex_output_dir.mkdir(parents=True, exist_ok=True)
 
         # Create presentation-specific folder
         output_folder = tex_output_dir / pptx_name
@@ -3116,6 +3417,12 @@ Examples:
         default='videos',
         help='Directory for extracted videos (default: videos)'
     )
+    parser.add_argument(
+        '--output-dir',
+        default=None,
+        help='Parent folder of the output folder <presentation-name>/ '
+             '(default: tex-output/ next to this script)'
+    )
 
     args = parser.parse_args()
 
@@ -3151,7 +3458,8 @@ Examples:
                 str(input_path),
                 str(output_path),
                 fig_dir=args.fig_dir,
-                video_dir=args.video_dir
+                video_dir=args.video_dir,
+                output_root=args.output_dir
             )
             converter.save()
         except Exception as e:

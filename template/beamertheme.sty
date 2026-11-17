@@ -8,18 +8,50 @@
 \pgfplotsset{compat=1.18}
 \usepgfplotslibrary{fillbetween}
 \pgfdeclarelayer{bg}
-\RequirePackage{helvet}
+\RequirePackage{iftex}
+% Sans-serif text font with both engines (Helvetica clones shipped with TeX Live
+% and MiKTeX). Under LuaLaTeX, helvet would silently fall back to Latin Modern Sans.
+\ifPDFTeX
+  \RequirePackage{helvet}
+\else
+  \RequirePackage{fontspec}
+  \setsansfont{texgyreheros}[Extension=.otf,UprightFont=*-regular,BoldFont=*-bold,
+    ItalicFont=*-italic,BoldItalicFont=*-bolditalic]
+\fi
 \RequirePackage{xcolor}
 \RequirePackage{graphicx}
 \RequirePackage{hyperref}
 \RequirePackage{varwidth}
-\RequirePackage{movie15}
+% Videos: see \pptxvideo below (movie15 is no longer used: it needs pdfLaTeX and
+% Acrobat's legacy multimedia, which current viewers no longer play).
 \RequirePackage{latexsym}
 \RequirePackage{amsmath,amssymb,amsfonts}
 \RequirePackage{wrapfig}
 \RequirePackage{setspace}
 \RequirePackage{anyfontsize}
 \RequirePackage{epsfig}
+% === Videos =================================================================
+% \pptxvideo[<width>]{<clip>}{<poster>}  (paths relative to the main .tex file)
+% The clip is NOT embedded: the poster image is a relative link (PDF Launch
+% action) to the clip, so the videos/ folder must stay next to the PDF.
+%  * Adobe Acrobat Reader (Windows, macOS), SumatraPDF, Okular, Evince: the clip
+%    opens in the default player (Acrobat asks for confirmation first).
+%  * pdfpc: plays the clip inline on click. With \pptxvideoautoplaytrue in the
+%    preamble, pdfpc starts and loops it automatically ("?autostart&loop"
+%    query: pdfpc only, Acrobat would look for a file of that name).
+%  * Browser PDF viewers block launch links: the poster and file name remain.
+\newif\ifpptxvideoautoplay
+\begingroup\catcode`\&=12 \gdef\pptxurlamp{&}\endgroup
+\newcommand{\pptxvideo}[3][0.9\textwidth]{%
+  \begingroup
+  \ifpptxvideoautoplay\edef\pptxvideotarget{run:#2?autostart\pptxurlamp loop}%
+  \else\edef\pptxvideotarget{run:#2}\fi
+  \expandafter\href\expandafter{\pptxvideotarget}%
+    {\includegraphics[width=#1,height=0.72\textheight,keepaspectratio]{#3}}%
+  \par{\tiny\expandafter\href\expandafter{\pptxvideotarget}%
+    {\textcolor{gray}{$\blacktriangleright$\ video: \detokenize{#2}}}}%
+  \endgroup}
+
 % --- Work‑around for enumitem+beamer loop (missing \labelenumi) ---
 \makeatletter
 \@ifundefined{labelenumi}{\def\labelenumi{\arabic{enumi}.}}{}

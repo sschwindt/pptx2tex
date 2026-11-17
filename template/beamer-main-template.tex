@@ -1,5 +1,6 @@
 % !TeX spellcheck = en_US
-% COMPILE WITH LuaLatex !!!
+% Compile twice with pdfLaTeX or LuaLaTeX (both work; same Helvetica-like font).
+% Videos: set \pptxvideoautoplaytrue after \usetheme for pdfpc autostart (pdfpc only).
 
 % Other paper formats are possible: aspectratio = 43 (4:3), 169 (16:9), etc...
 % If you set the option "handout", overlay effects will be ignored:
@@ -10,8 +11,8 @@ aspectratio=169,% for widescreen (16:9) presentations
 % handout,%
 ]{beamer}
 
-\usepackage[utf8]{}
-\usepackage[T1]{fontenc}
+\usepackage{iftex}
+\ifPDFTeX\usepackage[T1]{fontenc}\fi % LuaLaTeX: Unicode fonts via fontspec (theme)
 \usepackage{circledsteps}
 
 % Title and author
