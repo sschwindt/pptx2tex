@@ -126,15 +126,21 @@ class PPTXToLatexConverter:
     BEAMER_169_TEXTHEIGHT_CM = 8.0   # Usable text height (excluding header/footer)
 
     def __init__(self, input_path: str, output_path: str,
-                 fig_dir: str = "fig", video_dir: str = "videos"):
+                 fig_dir: str = "fig", video_dir: str = "videos",
+                 output_root: Optional[str] = None):
         self.input_path = Path(input_path)
         self.output_path = Path(output_path)
+        # parent folder of the per-presentation output folder (None: tex-output/
+        # next to this script, the historical default)
+        self.output_root = Path(output_root) if output_root else None
         self.fig_dir = Path(fig_dir)
         self.video_dir = Path(video_dir)
         self.image_counter = 0
         self.video_counter = 0
+        self.video_posters = {}  # video filename -> poster-frame filename
         self.theme_colors = {}  # scheme key -> (r,g,b), populated from the theme
         self.raster_map = {}    # slide_num -> rendered figure filename
+        self.crop_map = {}      # slide_num -> [{'box': (l,t,w,h) EMU, 'filename', 'members'}]
 
         # Aspect ratio tracking - set during conversion
         self.source_slide_width = None   # EMU
@@ -276,6 +282,10 @@ class PPTXToLatexConverter:
         if not text:
             return ""
 
+        # PowerPoint soft line breaks (Shift+Enter) arrive as vertical tabs
+        # (U+000B), which no LaTeX engine accepts: use a plain space
+        text = text.replace('\x0b', ' ')
+
         # Order matters - escape backslash first
         replacements = [
             ('\\', r'\textbackslash{}'),
@@ -293,10 +303,42 @@ class PPTXToLatexConverter:
         for old, new in replacements:
             text = text.replace(old, new)
 
+        # Symbol-font characters (Wingdings, Symbol) arrive as private-use code
+        # points U+F0xx that no LaTeX font knows (pdfLaTeX stops with "Unicode
+        # character not set up"): map the common ones, drop the others
+        text = self._map_symbol_font_chars(text)
+
         # Convert math symbols after escaping special characters
         text = self.convert_math_symbols(text)
 
         return text
+
+    # Private-use code points of PowerPoint symbol fonts -> Unicode (converted to
+    # LaTeX by convert_math_symbols) or directly to LaTeX. Arrows win where
+    # Wingdings and Symbol disagree: they are by far the most frequent use.
+    SYMBOL_FONT_CHARS = {
+        0xF0E0: '→', 0xF0E8: '→', 0xF0F0: '→', 0xF0D8: '→', 0xF0E2: '→', 0xF0AE: '→',
+        0xF0DE: '⇒', 0xF0DF: '⇐', 0xF0AC: '←', 0xF0E7: '←',
+        0xF0B3: '≥', 0xF0A3: '≤', 0xF0B1: '±', 0xF0B4: '×', 0xF0BB: '≈', 0xF0B9: '≠',
+        0xF0A7: r'\textbullet{}', 0xF0B7: r'\textbullet{}', 0xF06C: r'\textbullet{}',
+        0xF06E: r'$\blacksquare$', 0xF0FC: r'$\checkmark$', 0xF0FB: r'$\times$',
+    }
+
+    def _map_symbol_font_chars(self, text: str) -> str:
+        """Replace private-use symbol-font characters (U+E000-U+F8FF)."""
+        if not any(0xE000 <= ord(c) <= 0xF8FF for c in text):
+            return text
+        out = []
+        for c in text:
+            cp = ord(c)
+            if 0xE000 <= cp <= 0xF8FF:
+                if cp in self.SYMBOL_FONT_CHARS:
+                    out.append(self.SYMBOL_FONT_CHARS[cp])
+                else:
+                    print(f"  Warning: dropped symbol-font character U+{cp:04X} (no LaTeX equivalent known)")
+            else:
+                out.append(c)
+        return ''.join(out)
 
     def convert_math_symbols(self, text: str) -> str:
         """Convert mathematical symbols to LaTeX math mode equivalents."""
@@ -507,7 +549,8 @@ class PPTXToLatexConverter:
         """Clean and normalize text from PPTX."""
         if not text:
             return ""
-        # Remove excessive whitespace
+        # Remove excessive whitespace (\s also covers the vertical tab U+000B
+        # that PowerPoint uses for soft line breaks)
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
@@ -796,21 +839,143 @@ class PPTXToLatexConverter:
             'has_marker': self._paragraph_has_marker(para),
         }
 
+    # Vector/metafile formats that Pillow cannot rasterize on Linux/macOS
+    EXTERNAL_RASTER_EXTS = ('emf', 'wmf', 'svg')
+
+    def _rasterize_external(self, blob: bytes, ext: str, dpi: int = 220):
+        """Rasterize EMF/WMF/SVG data that Pillow cannot load (returns a PIL image or None).
+
+        Inkscape renders metafiles cropped to their content; LibreOffice is used
+        as a fallback for EMF/WMF (it places the drawing on a page, so the result
+        is trimmed to its non-white bounding box).
+        """
+        if not HAS_PIL:
+            return None
+        tmp = tempfile.mkdtemp(prefix='pptx2tex_img_')
+        try:
+            src = os.path.join(tmp, f'src.{ext}')
+            with open(src, 'wb') as f:
+                f.write(blob)
+            inkscape = shutil.which('inkscape')
+            if inkscape:
+                out = os.path.join(tmp, 'out.png')
+                try:
+                    subprocess.run([inkscape, src, '--export-type=png', f'--export-filename={out}',
+                                    f'--export-dpi={dpi}'], check=True, capture_output=True, timeout=300)
+                    if os.path.exists(out):
+                        return Image.open(out).copy()
+                except Exception as e:
+                    print(f"  Warning: Inkscape could not convert .{ext} image: {e}")
+            soffice = shutil.which('libreoffice') or shutil.which('soffice')
+            if soffice and ext in ('emf', 'wmf'):
+                try:
+                    subprocess.run([soffice, self._lo_profile_arg(tmp), '--headless', '--convert-to', 'png', '--outdir', tmp, src],
+                                   check=True, capture_output=True, timeout=300)
+                    out = os.path.join(tmp, 'src.png')
+                    if os.path.exists(out):
+                        img = Image.open(out).convert('RGB')
+                        # trim the white page around the drawing
+                        from PIL import ImageChops
+                        bg = Image.new('RGB', img.size, (255, 255, 255))
+                        bbox = ImageChops.difference(img, bg).getbbox()
+                        return img.crop(bbox) if bbox else img
+                except Exception as e:
+                    print(f"  Warning: LibreOffice could not convert .{ext} image: {e}")
+            return None
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _picture_blob(self, shape):
+        """Return (blob, ext) of a picture shape, including SVG-only pictures.
+
+        Office icons are stored as an SVG (asvg:svgBlip) without a raster
+        r:embed fallback; python-pptx then raises 'no embedded image'.
+        """
+        try:
+            image = shape.image
+            return image.blob, (image.ext or '').lower()
+        except Exception:
+            pass
+        try:
+            svg_ids = shape._element.xpath('.//asvg:svgBlip/@r:embed') if hasattr(shape, '_element') else []
+        except Exception:
+            # namespace prefixes not registered: fall back to a regex on the XML
+            svg_ids = re.findall(r'svgBlip[^>]*r:embed="([^"]+)"', shape._element.xml)
+        for rid in svg_ids:
+            try:
+                return shape.part.related_part(rid).blob, 'svg'
+            except Exception:
+                continue
+        return None, None
+
+    # Output resolution of extracted images (long side, pixels) and JPG quality
+    MAX_IMAGE_PX = 2000
+    JPEG_QUALITY = 90
+
+    @staticmethod
+    def _quarter_turn(shape) -> bool:
+        """True if the shape is rotated by about 90 or 270 degrees."""
+        try:
+            return round((shape.rotation or 0) / 90) % 2 == 1
+        except Exception:
+            return False
+
+    def _apply_shape_transform(self, img, shape):
+        """Rotate/mirror an extracted picture as it is shown on the slide.
+
+        PowerPoint stores the original image and applies <a:xfrm rot=... flipH/flipV>
+        when drawing it; python-pptx returns the untransformed blob.
+        """
+        try:
+            from PIL import ImageOps
+            xfrm = shape._element.xpath('./p:spPr/a:xfrm')
+            if xfrm:
+                if xfrm[0].get('flipH') in ('1', 'true'):
+                    img = ImageOps.mirror(img)
+                if xfrm[0].get('flipV') in ('1', 'true'):
+                    img = ImageOps.flip(img)
+            angle = (getattr(shape, 'rotation', 0) or 0) % 360
+            if angle:
+                # PowerPoint angles are clockwise, PIL's are counter-clockwise
+                fill = (255, 255, 255, 0) if img.mode == 'RGBA' else 'white'
+                if img.mode not in ('RGB', 'RGBA', 'L'):
+                    img = img.convert('RGBA'); fill = (255, 255, 255, 0)
+                img = img.rotate(-angle, expand=True, fillcolor=fill)
+        except Exception as e:
+            print(f"  Warning: could not apply rotation/flip of '{getattr(shape, 'name', '')}': {e}")
+        return img
+
     def extract_image(self, shape, slide_num: int, slide_width=None, slide_height=None) -> Optional[dict]:
         """Extract image from shape, convert to high-resolution JPG (220 dpi), and save to fig directory.
 
+        EMF/WMF metafiles and SVG-only pictures (Office icons) are rasterized
+        with Inkscape (or LibreOffice) because Pillow cannot render them.
         Returns dict with 'filename', 'width_ratio', and bounding box info for overlay detection.
         """
         try:
-            if hasattr(shape, 'image'):
-                image = shape.image
+            blob, ext = self._picture_blob(shape)
+            if blob is not None:
                 self.image_counter += 1
                 filename = f"slide{slide_num:02d}_img{self.image_counter:03d}.jpg"
                 filepath = self.fig_dir / filename
 
                 if HAS_PIL:
                     # Convert to JPG at 220 dpi
-                    img = Image.open(io.BytesIO(image.blob))
+                    try:
+                        img = Image.open(io.BytesIO(blob))
+                        img.load()
+                    except Exception:
+                        img = self._rasterize_external(blob, ext) if ext in self.EXTERNAL_RASTER_EXTS else None
+                        if img is None:
+                            raise ValueError(f"cannot rasterize .{ext} image")
+                    # Apply the picture's own rotation/flip from PowerPoint: the
+                    # stored image is unrotated (a plan turned by 90 deg on the
+                    # slide would otherwise be extracted sideways)
+                    img = self._apply_shape_transform(img, shape)
+                    # Cap the resolution: slides never need more, and full-size
+                    # photos at quality 95 bloat the output (and its repository)
+                    if max(img.size) > self.MAX_IMAGE_PX:
+                        img.thumbnail((self.MAX_IMAGE_PX, self.MAX_IMAGE_PX), Image.LANCZOS)
                     # Convert to RGB if necessary (e.g., PNG with transparency)
                     if img.mode in ('RGBA', 'LA', 'P'):
                         # Create white background for transparent images
@@ -822,58 +987,129 @@ class PPTXToLatexConverter:
                     elif img.mode != 'RGB':
                         img = img.convert('RGB')
                     # Save as JPG with 220 dpi
-                    img.save(filepath, 'JPEG', quality=95, dpi=(220, 220))
+                    img.save(filepath, 'JPEG', quality=self.JPEG_QUALITY, dpi=(220, 220),
+                             optimize=True)
                 else:
                     # Fallback: save original format if PIL not available
-                    ext = image.ext
                     filename = f"slide{slide_num:02d}_img{self.image_counter:03d}.{ext}"
                     filepath = self.fig_dir / filename
                     with open(filepath, 'wb') as f:
-                        f.write(image.blob)
+                        f.write(blob)
 
-                # Calculate width ratio relative to slide
+                # Calculate width ratio relative to slide (a picture turned by
+                # 90/270 deg shows its frame height as width)
                 width_ratio = 0.8  # Default
-                if slide_width and hasattr(shape, 'width') and shape.width:
-                    width_ratio = min(0.95, shape.width / slide_width)
+                shown_width = shape.width if hasattr(shape, 'width') else None
+                if self._quarter_turn(shape) and getattr(shape, 'height', None):
+                    shown_width = shape.height
+                if slide_width and shown_width:
+                    width_ratio = min(0.95, shown_width / slide_width)
                     # Round to reasonable precision
                     width_ratio = round(width_ratio, 2)
 
-                # Store bounding box in EMU for overlay detection
+                # Store bounding box in EMU (slide coordinates, also for
+                # pictures inside groups) for overlay detection and placement
+                bl, bt, bw, bh = self.abs_geometry(shape)
+                if slide_width and bw:
+                    width_ratio = round(min(0.95, (bh if self._quarter_turn(shape) else bw) / slide_width), 2)
                 return {
                     'filename': filename,
                     'width_ratio': width_ratio,
-                    'left': shape.left if hasattr(shape, 'left') else 0,
-                    'top': shape.top if hasattr(shape, 'top') else 0,
-                    'width': shape.width if hasattr(shape, 'width') else 0,
-                    'height': shape.height if hasattr(shape, 'height') else 0,
+                    'left': bl,
+                    'top': bt,
+                    'width': bw,
+                    'height': bh,
                 }
         except Exception as e:
             print(f"Warning: Could not extract image: {e}")
         return None
 
-    def extract_video(self, shape, slide_num: int) -> Optional[str]:
-        """Extract video from shape and save to videos directory."""
+    @staticmethod
+    def is_video_shape(shape) -> bool:
+        """True for any shape carrying a video, including video placeholders.
+
+        A video inserted into a content placeholder reports shape_type
+        PLACEHOLDER, not MEDIA, so the XML is checked instead.
+        """
         try:
             if shape.shape_type == MSO_SHAPE_TYPE.MEDIA:
-                # Access the media part
-                if hasattr(shape, '_element'):
-                    # Try to get video from the shape's media
-                    for rel in shape.part.rels.values():
-                        if "video" in rel.reltype.lower():
-                            self.video_counter += 1
-                            # Determine extension from content type
-                            content_type = getattr(rel.target_part, 'content_type', 'video/mp4')
-                            ext = content_type.split('/')[-1] if '/' in content_type else 'mp4'
-                            filename = f"slide{slide_num:02d}_vid{self.video_counter:03d}.{ext}"
-                            filepath = self.video_dir / filename
+                return True
+            xml = shape._element.xml
+            return 'videoFile' in xml or 'p14:media' in xml
+        except Exception:
+            return False
 
-                            with open(filepath, 'wb') as f:
-                                f.write(rel.target_part.blob)
+    def extract_video(self, shape, slide_num: int) -> Optional[str]:
+        """Extract the video of *this* shape (and its poster frame) to the videos directory.
 
-                            return filename
+        The media part is resolved through the shape's own relationship ids
+        (p14:media r:embed, else a:videoFile r:link). Iterating over all slide
+        relationships would return the first video of the slide for every
+        video shape. The poster frame (the shape's blip) is saved as
+        <video>-poster.jpg and remembered in self.video_posters.
+        """
+        try:
+            if not self.is_video_shape(shape):
+                return None
+            xml = shape._element.xml
+            rids = re.findall(r'<p14:media[^>]*r:embed="([^"]+)"', xml) + \
+                re.findall(r'<a:videoFile[^>]*r:link="([^"]+)"', xml)
+            part = None
+            for rid in rids:
+                try:
+                    part = shape.part.related_part(rid)
+                    break
+                except Exception:
+                    continue  # external (linked, not embedded) video
+            if part is None:
+                print(f"Warning: slide {slide_num}: video is linked, not embedded - skipped")
+                return None
+            self.video_counter += 1
+            content_type = getattr(part, 'content_type', 'video/mp4')
+            ext = content_type.split('/')[-1] if '/' in content_type else 'mp4'
+            ext = {'quicktime': 'mov', 'x-msvideo': 'avi', 'x-ms-wmv': 'wmv', 'mpeg': 'mpg'}.get(ext, ext)
+            filename = f"slide{slide_num:02d}_vid{self.video_counter:03d}.{ext}"
+            with open(self.video_dir / filename, 'wb') as f:
+                f.write(part.blob)
+
+            # poster frame = the picture shown before playback
+            poster_ids = re.findall(r'<a:blip[^>]*r:embed="([^"]+)"', xml)
+            if poster_ids and HAS_PIL:
+                try:
+                    blob = shape.part.related_part(poster_ids[0]).blob
+                    img = Image.open(io.BytesIO(blob)).convert('RGB')
+                    poster = f"{Path(filename).stem}-poster.jpg"
+                    img.save(self.video_dir / poster, 'JPEG', quality=90)
+                    self.video_posters[filename] = poster
+                except Exception as e:
+                    print(f"Warning: slide {slide_num}: could not save video poster: {e}")
+            return filename
         except Exception as e:
             print(f"Warning: Could not extract video: {e}")
         return None
+
+    def table_to_latex(self, table) -> str:
+        """Convert a PowerPoint table to a LaTeX tabular with proportional p-columns."""
+        try:
+            widths = [col.width or 0 for col in table.columns]
+            total = float(sum(widths)) or 1.0
+            spec = ''.join(f"p{{{max(0.04, 0.95 * w / total):.2f}\\textwidth}}" for w in widths)
+            rows = []
+            for r_idx, row in enumerate(table.rows):
+                cells = []
+                for cell in row.cells:
+                    paras = [self.process_paragraph_with_formatting(p)['text'] for p in cell.text_frame.paragraphs]
+                    text = r' \newline '.join(t for t in paras if t.strip())
+                    if r_idx == 0:
+                        text = f"\\textbf{{{text}}}" if text else text
+                    cells.append(text)
+                rows.append(' & '.join(cells) + r' \\ \hline')
+            size = r'\footnotesize' if len(rows) > 8 else r'\small'
+            return '\n'.join([f'{{{size}', f'\\begin{{tabular}}{{{spec}}}', r'\hline'] + rows +
+                             [r'\end{tabular}}'])
+        except Exception as e:
+            print(f"Warning: Could not convert table: {e}")
+            return ''
 
     def process_text_frame(self, text_frame, base_font_size: float = 11.0) -> list:
         """Process text frame and return list of paragraphs with formatting info."""
@@ -1311,6 +1547,66 @@ class PPTXToLatexConverter:
             print(f"Warning: Could not convert text shape to TikZ overlay: {e}")
             return None
 
+    @staticmethod
+    def abs_geometry(shape):
+        """Slide geometry (left, top, width, height in EMU) of a shape.
+
+        Children of group shapes store their position in the child coordinate
+        system of the group (a:chOff/a:chExt); python-pptx returns those raw
+        values. They are mapped through every enclosing group transform here.
+        """
+        x, y = shape.left or 0, shape.top or 0
+        cx, cy = shape.width or 0, shape.height or 0
+        try:
+            el = shape._element.getparent()
+        except Exception:
+            el = None
+        while el is not None and el.tag == qn('p:grpSp'):
+            xfrm = el.find(qn('p:grpSpPr') + '/' + qn('a:xfrm'))
+            if xfrm is None:
+                break
+            off, ext = xfrm.find(qn('a:off')), xfrm.find(qn('a:ext'))
+            choff, chext = xfrm.find(qn('a:chOff')), xfrm.find(qn('a:chExt'))
+            if off is None or ext is None:
+                break
+            ox, oy = int(off.get('x', 0)), int(off.get('y', 0))
+            ecx, ecy = int(ext.get('cx', 0)), int(ext.get('cy', 0))
+            cox = int(choff.get('x', 0)) if choff is not None else ox
+            coy = int(choff.get('y', 0)) if choff is not None else oy
+            ccx = int(chext.get('cx', 0)) if chext is not None else ecx
+            ccy = int(chext.get('cy', 0)) if chext is not None else ecy
+            sx = ecx / ccx if ccx else 1.0
+            sy = ecy / ccy if ccy else 1.0
+            x, y = ox + (x - cox) * sx, oy + (y - coy) * sy
+            cx, cy = cx * sx, cy * sy
+            el = el.getparent()
+        return int(x), int(y), int(cx), int(cy)
+
+    class _AbsShape:
+        """Proxy of a group child that reports slide coordinates (see abs_geometry)."""
+        def __init__(self, shape, geom):
+            object.__setattr__(self, '_shape', shape)
+            object.__setattr__(self, '_geom', geom)
+
+        def __getattr__(self, name):
+            g = object.__getattribute__(self, '_geom')
+            if name in ('left', 'top', 'width', 'height'):
+                return g[('left', 'top', 'width', 'height').index(name)]
+            return getattr(object.__getattribute__(self, '_shape'), name)
+
+    def group_children(self, group):
+        """Children of a group as proxies with slide coordinates (nested groups flattened)."""
+        out = []
+        for child in group.shapes:
+            try:
+                if child.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    out.extend(self.group_children(child))
+                else:
+                    out.append(self._AbsShape(child, self.abs_geometry(child)))
+            except Exception:
+                continue
+        return out
+
     def extract_all_images_from_shape(self, shape, slide_num: int, slide_width=None, slide_height=None, depth=0) -> list:
         """Recursively extract images from any shape type.
 
@@ -1334,11 +1630,9 @@ class PPTXToLatexConverter:
 
             # Handle regular pictures
             if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                # extract_image already returns the slide bounding box in EMU
                 img_info = self.extract_image(shape, slide_num, slide_width, slide_height)
                 if img_info:
-                    # Add position info
-                    img_info['left'] = self.emu_to_textwidth(shape.left, slide_width) if slide_width else 0
-                    img_info['top'] = self.emu_to_cm(shape.top)
                     images.append(img_info)
                 return images
 
@@ -1348,8 +1642,6 @@ class PPTXToLatexConverter:
                 if hasattr(shape, 'image'):
                     img_info = self.extract_image(shape, slide_num, slide_width, slide_height)
                     if img_info:
-                        img_info['left'] = self.emu_to_textwidth(shape.left, slide_width) if slide_width else 0
-                        img_info['top'] = self.emu_to_cm(shape.top)
                         images.append(img_info)
                 return images
 
@@ -1379,11 +1671,11 @@ class PPTXToLatexConverter:
                                 img.save(filepath, 'JPEG', quality=95, dpi=(220, 220))
 
                                 width_ratio = self.emu_to_textwidth(shape.width, slide_width)
+                                bl, bt, bw, bh = self.abs_geometry(shape)
                                 images.append({
                                     'filename': filename,
                                     'width_ratio': round(width_ratio, 2),
-                                    'left': self.emu_to_textwidth(shape.left, slide_width) if slide_width else 0,
-                                    'top': self.emu_to_cm(shape.top)
+                                    'left': bl, 'top': bt, 'width': bw, 'height': bh,
                                 })
                 except Exception:
                     pass  # Fill image extraction is optional
@@ -1685,6 +1977,7 @@ class PPTXToLatexConverter:
             'content_items': [],
             'images': [],
             'videos': [],
+            'tables': [],  # LaTeX tabular strings, in reading order
             'positioned_elements': []  # New: stores all positioned shapes
         }
 
@@ -1696,24 +1989,73 @@ class PPTXToLatexConverter:
         all_shapes = list(slide.shapes)
         text_shapes_to_process = []  # Will be processed in second pass
 
+        # Vector drawings (freeform clusters) rendered as cropped images: the
+        # crop replaces the shapes it covers (see find_vector_clusters)
+        crops = self.crop_map.get(slide_num, [])
+        for crop in crops:
+            l, t, w, h = crop['box']
+            result['images'].append({
+                'filename': crop['filename'],
+                'width_ratio': round(min(0.95, w / slide_width), 2) if slide_width else 0.8,
+                'left': l, 'top': t, 'width': w, 'height': h,
+            })
+
+        def _in_crop(shp):
+            if not crops:
+                return False
+            try:
+                if getattr(shp, "shape_id", None) in {m for c in crops for m in c["members"]}:
+                    return True
+                if getattr(shp, 'is_placeholder', False):
+                    return False
+                l, t, w, h = self.abs_geometry(shp)
+            except Exception:
+                return False
+            tol_x, tol_y = 0.01 * slide_width, 0.01 * slide_height
+            for c in crops:
+                cl, ct, cw, ch = c['box']
+                if l >= cl - tol_x and t >= ct - tol_y and l + w <= cl + cw + tol_x and t + h <= ct + ch + tol_y:
+                    return True
+            return False
+
         # === PASS 1: Extract all images first (needed for overlap detection) ===
         for shape in all_shapes:
             try:
                 shape_type = shape.shape_type
+                if _in_crop(shape):
+                    continue
 
                 # Handle grouped shapes - extract images recursively
                 if shape_type == MSO_SHAPE_TYPE.GROUP:
                     result['images'].extend(
                         self.extract_all_images_from_shape(shape, slide_num, slide_width, slide_height)
                     )
-                    # Queue grouped text shapes for second pass
-                    for child_shape in shape.shapes:
-                        if hasattr(child_shape, 'text_frame') and child_shape.text:
+                    # Queue grouped text shapes for second pass, with their
+                    # slide coordinates (not the group's child coordinates)
+                    for child_shape in self.group_children(shape):
+                        if getattr(child_shape, 'has_text_frame', False) and child_shape.text:
                             text_shapes_to_process.append(child_shape)
                     continue
 
-                # Check for image in ANY shape that has an 'image' attribute
-                if hasattr(shape, 'image') and shape.image is not None:
+                # Videos first: a video placeholder also exposes its poster as
+                # an 'image' and would otherwise be taken for a picture
+                if self.is_video_shape(shape):
+                    vid_file = self.extract_video(shape, slide_num)
+                    if vid_file:
+                        result['videos'].append(vid_file)
+                    continue
+
+                # Tables (graphic frames) carry no text_frame of their own
+                if getattr(shape, 'has_table', False) and shape.has_table:
+                    tab = self.table_to_latex(shape.table)
+                    if tab:
+                        result['tables'].append(tab)
+                    continue
+
+                # Check for image in ANY shape that carries picture data. (hasattr()
+                # is not safe here: the .image property raises ValueError, not
+                # AttributeError, for SVG-only pictures.)
+                if self._picture_blob(shape)[0] is not None:
                     img_info = self.extract_image(shape, slide_num, slide_width, slide_height)
                     if img_info:
                         result['images'].append(img_info)
@@ -1758,7 +2100,15 @@ class PPTXToLatexConverter:
                 left = shp.left if shp.left is not None else None
             except Exception:
                 left = None
-            content_blocks.append({'top': top, 'left': left, 'paras': paras})
+            try:
+                right = left + shp.width if (left is not None and shp.width is not None) else None
+            except Exception:
+                right = None
+            try:
+                bottom = top + shp.height if (top is not None and shp.height is not None) else None
+            except Exception:
+                bottom = None
+            content_blocks.append({'top': top, 'left': left, 'right': right, 'bottom': bottom, 'paras': paras})
 
         for shape in text_shapes_to_process:
             try:
@@ -1810,10 +2160,9 @@ class PPTXToLatexConverter:
                         shape_text_lower = shape_text.lower()
                         # Only treat as source if it's short (single line citation) and starts with source pattern
                         is_short_text = len(shape_text) < 200 and '\n' not in shape_text
-                        starts_with_source = any(shape_text_lower.startswith(pattern) for pattern in [
-                            'quelle:', 'source:', 'bildquelle:', 'datenquelle:',
-                            'videoquelle:', 'grafikquelle:'
-                        ])
+                        # also accepts the French typography "Source : ..."
+                        starts_with_source = re.match(
+                            r'(?:(?:bild|daten|video|grafik)?quelle|sources?)\s*:', shape_text_lower) is not None
                         if is_short_text and starts_with_source:
                             # Extract source text for later use
                             result.setdefault('sources', []).append(shape_text)
@@ -1859,6 +2208,17 @@ class PPTXToLatexConverter:
         ):
             result['content_items'].extend(block['paras'])
 
+        # Horizontal extent of the body text (EMU), used by slide_to_latex to put
+        # pictures that sit beside the text into a column instead of below it
+        spans = [(b['left'], b['right']) for b in content_blocks
+                 if b.get('left') is not None and b.get('right') is not None]
+        result['text_extent'] = (min(s[0] for s in spans), max(s[1] for s in spans)) if spans else None
+        vspans = [(b['top'], b['bottom']) for b in content_blocks
+                  if b.get('top') is not None and b.get('bottom') is not None]
+        result['text_vextent'] = (min(v[0] for v in vspans), max(v[1] for v in vspans)) if vspans else None
+        result['text_maxchars'] = max((len(self.clean_text(p.get('raw_text', p.get('text', ''))))
+                                       for b in content_blocks for p in b['paras']), default=0)
+
         # Determine if we need unified TikZ rendering
         # Criteria: multiple images OR (images + positioned elements)
         num_images = len(result['images'])
@@ -1902,6 +2262,35 @@ class PPTXToLatexConverter:
         except Exception:
             return False
 
+    def _has_visual_content(self, shapes) -> bool:
+        """True if the shapes contain pictures, videos, tables or charts (groups included)."""
+        for shape in shapes:
+            try:
+                if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    if self._has_visual_content(shape.shapes):
+                        return True
+                    continue
+                if self.is_video_shape(shape):
+                    return True
+                if getattr(shape, 'has_table', False) and shape.has_table:
+                    return True
+                if getattr(shape, 'has_chart', False) and shape.has_chart:
+                    return True
+                if self._picture_blob(shape)[0] is not None:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def is_pure_section_divider(self, slide) -> bool:
+        """A section-header slide that only carries text (title, list of topics).
+
+        Decks sometimes reuse the section-header layout for ordinary content
+        slides (e.g. a title plus photos). Those must be rendered as frames,
+        otherwise their pictures are silently dropped.
+        """
+        return self.is_section_divider(slide) and not self._has_visual_content(slide.shapes)
+
     # A slide with at least this many freeform (vector) shapes is treated as
     # non-reproducible vector art and rendered to an image instead.
     RASTER_FREEFORM_THRESHOLD = 15
@@ -1919,6 +2308,100 @@ class PPTXToLatexConverter:
                 continue
         return count
 
+    # Freeform clusters with at least this many freeforms and this share of
+    # the slide area are rendered as a cropped image of the slide
+    CROP_MIN_FREEFORMS = 3
+    CROP_MIN_AREA = 0.04
+
+    @staticmethod
+    def _lo_profile_arg(tmp_dir) -> str:
+        """Private LibreOffice user profile inside tmp_dir.
+
+        Headless LibreOffice refuses to start (exit status 1) while another
+        instance uses the same default profile, e.g. when several decks are
+        converted in parallel or LibreOffice is open on the desktop.
+        """
+        return '-env:UserInstallation=' + Path(tmp_dir, 'lo-profile').resolve().as_uri()
+
+    def find_vector_clusters(self, slide, slide_width, slide_height) -> list:
+        """Regions of a slide drawn with freeform (vector) shapes.
+
+        Freeforms are not converted to TikZ, so a drawing made of them (e.g. a
+        cross section with water levels) would be lost and only the pictures
+        inside its groups would survive. Groups containing freeforms and
+        top-level freeforms are merged into clusters by proximity; each
+        cluster is returned as {'box': (l, t, w, h) EMU, 'members': element ids}.
+        """
+        items = []  # [box, freeform count, member element ids]
+        for shape in slide.shapes:
+            try:
+                if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    n = self._count_freeforms(shape.shapes)
+                    if n:
+                        items.append([list(self.abs_geometry(shape)), n, {shape.shape_id}])
+                elif shape.shape_type == MSO_SHAPE_TYPE.FREEFORM:
+                    items.append([list(self.abs_geometry(shape)), 1, {shape.shape_id}])
+            except Exception:
+                continue
+        if not items:
+            return []
+        gx, gy = 0.05 * slide_width, 0.05 * slide_height
+
+        def near(a, b):
+            return not (a[0] + a[2] + gx < b[0] or b[0] + b[2] + gx < a[0] or
+                        a[1] + a[3] + gy < b[1] or b[1] + b[3] + gy < a[1])
+        merged = True
+        while merged:
+            merged = False
+            for i in range(len(items)):
+                for j in range(i + 1, len(items)):
+                    if near(items[i][0], items[j][0]):
+                        a, b = items[i][0], items[j][0]
+                        l, t = min(a[0], b[0]), min(a[1], b[1])
+                        r, btm = max(a[0] + a[2], b[0] + b[2]), max(a[1] + a[3], b[1] + b[3])
+                        items[i] = [[l, t, r - l, btm - t], items[i][1] + items[j][1], items[i][2] | items[j][2]]
+                        del items[j]
+                        merged = True
+                        break
+                if merged:
+                    break
+        # small non-placeholder shapes next to a drawing (numbers, arrows,
+        # labels) belong to it: absorb them, otherwise they would be drawn a
+        # second time on top of (or beside) the cropped image
+        small = 0.02 * slide_width * slide_height
+        for shape in slide.shapes:
+            try:
+                if shape.is_placeholder or shape.shape_type in (MSO_SHAPE_TYPE.GROUP, MSO_SHAPE_TYPE.FREEFORM):
+                    continue
+                if shape.shape_type == MSO_SHAPE_TYPE.MEDIA or getattr(shape, 'has_table', False):
+                    continue
+                bl, bt, bw, bh = self.abs_geometry(shape)
+            except Exception:
+                continue
+            if bw * bh > small:
+                continue
+            for it in items:
+                a = it[0]
+                if (bl >= a[0] - gx and bt >= a[1] - gy and
+                        bl + bw <= a[0] + a[2] + gx and bt + bh <= a[1] + a[3] + gy):
+                    l, t = min(a[0], bl), min(a[1], bt)
+                    r, btm = max(a[0] + a[2], bl + bw), max(a[1] + a[3], bt + bh)
+                    it[0] = [l, t, r - l, btm - t]
+                    it[2] = it[2] | {shape.shape_id}
+                    break
+        clusters = []
+        for box, n, members in items:
+            if n >= self.CROP_MIN_FREEFORMS and box[2] * box[3] >= self.CROP_MIN_AREA * slide_width * slide_height:
+                # small margin, clipped to the slide
+                mx, my = 0.006 * slide_width, 0.006 * slide_height
+                l, t = max(0, box[0] - mx), max(0, box[1] - my)
+                r = min(slide_width, box[0] + box[2] + mx)
+                b = min(slide_height, box[1] + box[3] + my)
+                if r - l < 0.02 * slide_width or b - t < 0.02 * slide_height:
+                    continue  # drawing (almost) entirely outside the slide
+                clusters.append({'box': (int(l), int(t), int(r - l), int(b - t)), 'members': members})
+        return clusters
+
     def slide_needs_raster(self, slide) -> bool:
         """True if a slide is dominated by non-reproducible vector graphics."""
         try:
@@ -1926,7 +2409,7 @@ class PPTXToLatexConverter:
         except Exception:
             return False
 
-    def _rasterize_slides(self, slide_numbers) -> dict:
+    def _rasterize_slides(self, slide_numbers, crops=None) -> dict:
         """Render given 1-based slide numbers to images via LibreOffice.
 
         The whole presentation is converted to PDF once, then the requested
@@ -1934,8 +2417,9 @@ class PPTXToLatexConverter:
         Returns a mapping {slide_number: figure_filename}.
         """
         result = {}
+        crops = crops or {}
         slide_numbers = sorted(set(slide_numbers))
-        if not slide_numbers:
+        if not slide_numbers and not crops:
             return result
 
         soffice = shutil.which('libreoffice') or shutil.which('soffice')
@@ -1947,9 +2431,10 @@ class PPTXToLatexConverter:
 
         tmp = tempfile.mkdtemp(prefix='pptx2tex_raster_')
         try:
-            print(f"  Rasterizing {len(slide_numbers)} vector-graphics slide(s) via LibreOffice...")
+            print(f"  Rasterizing {len(slide_numbers)} vector-graphics slide(s) and "
+                  f"{sum(len(v) for v in crops.values())} vector drawing(s) via LibreOffice...")
             subprocess.run(
-                [soffice, '--headless', '--convert-to', 'pdf', '--outdir', tmp, str(self.input_path)],
+                [soffice, self._lo_profile_arg(tmp), '--headless', '--convert-to', 'pdf', '--outdir', tmp, str(self.input_path)],
                 check=True, capture_output=True, timeout=600
             )
             pdfs = glob.glob(os.path.join(tmp, '*.pdf'))
@@ -1978,8 +2463,36 @@ class PPTXToLatexConverter:
                     shutil.copy2(pages[0], self.fig_dir / f"slide{n:02d}_render.png")
                     fname = f"slide{n:02d}_render.png"
                 result[n] = fname
+            # cropped vector drawings (slide coordinates -> page pixels)
+            sw, sh = self.source_slide_width or 1, self.source_slide_height or 1
+            for n, clist in crops.items():
+                prefix = os.path.join(tmp, f'crop{n}')
+                subprocess.run(
+                    [pdftoppm, '-png', '-r', '250', '-f', str(n), '-l', str(n), pdf, prefix],
+                    check=True, capture_output=True, timeout=180
+                )
+                pages = glob.glob(prefix + '*.png')
+                if not pages or Image is None:
+                    clist.clear()
+                    continue
+                page = Image.open(pages[0]).convert('RGB')
+                pw, ph = page.size
+                for k, c in enumerate(clist, 1):
+                    l, t, w, h = c['box']
+                    box = (max(0, int(l / sw * pw)), max(0, int(t / sh * ph)),
+                           min(pw, int((l + w) / sw * pw)), min(ph, int((t + h) / sh * ph)))
+                    if box[2] - box[0] < 4 or box[3] - box[1] < 4:
+                        continue  # empty crop: keep the shapes as they are
+                    fname = f"slide{n:02d}_drawing{k}.jpg"
+                    try:
+                        page.crop(box).save(self.fig_dir / fname, 'JPEG', quality=90, dpi=(220, 220))
+                        c['filename'] = fname
+                    except Exception as e:
+                        print(f"  Warning: could not crop drawing {k} of slide {n}: {e}")
         except Exception as e:
             print(f"  Warning: rasterization failed: {e}")
+            for clist in crops.values():
+                clist.clear()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         return result
@@ -2068,9 +2581,14 @@ class PPTXToLatexConverter:
         filtered_items = []
         sources = []
 
+        # German "Quelle" needs a word boundary: without it, French questions
+        # such as "Quelles conséquences ... ?" matched and were turned into a
+        # truncated \source{s conséquences ...}. "Source(s)" requires a colon
+        # (also with the French space before it), otherwise headings such as
+        # "Sources d'entrave ..." were swallowed as credits.
         source_patterns = [
-            r'(?:Bild|Daten|Video|Grafik)?[Qq]uelle:?\s*(.+)',
-            r'Source:?\s*(.+)',
+            r'(?:bild|daten|video|grafik)?quelle\b\s*:?\s*(.+)',
+            r'sources?\s*:\s*(.+)',
         ]
 
         for item in content_items:
@@ -2285,12 +2803,25 @@ class PPTXToLatexConverter:
         if not all_elements and not positioned_elements:
             return lines
 
-        # Find bounding box of all images (in EMU)
-        if all_elements:
-            min_left = min(e['left'] for e in all_elements)
-            min_top = min(e['top'] for e in all_elements)
-            max_right = max(e['left'] + e['width'] for e in all_elements)
-            max_bottom = max(e['top'] + e['height'] for e in all_elements)
+        # Positioned text elements carry slide fractions (rel_x, ...), images EMU.
+        # Both must share ONE bounding box: the images used to be placed relative
+        # to their own bounding box while the labels stayed slide-relative, so the
+        # labels drifted whenever the pictures did not span the whole slide.
+        sw = getattr(self, 'slide_width_emu', None)
+        sh = getattr(self, 'slide_height_emu', None)
+        pos_boxes = []
+        if sw and sh:
+            for elem in positioned_elements:
+                pos_boxes.append((elem.get('rel_x', 0) * sw, elem.get('rel_y', 0) * sh,
+                                  elem.get('rel_width', 0.1) * sw, elem.get('rel_height', 0.05) * sh))
+
+        # Find bounding box of all images and labels (in EMU)
+        boxes = [(e['left'], e['top'], e['width'], e['height']) for e in all_elements] + pos_boxes
+        if boxes:
+            min_left = min(b[0] for b in boxes)
+            min_top = min(b[1] for b in boxes)
+            max_right = max(b[0] + b[2] for b in boxes)
+            max_bottom = max(b[1] + b[3] for b in boxes)
         else:
             min_left = min_top = 0
             max_right = max_bottom = 1
@@ -2377,9 +2908,19 @@ class PPTXToLatexConverter:
 
                 img_node_idx += 1
 
-        # Render positioned elements (text shapes, AutoShapes)
+        # Render positioned elements (text shapes, AutoShapes) in the same
+        # bounding-box frame as the images. The text width scales with the
+        # canvas (and with the column width when the pictures sit in a column).
+        col = getattr(self, '_column_factor', 1.0)
         for elem in positioned_elements:
-            self._render_positioned_element(lines, elem, canvas_width, canvas_height)
+            if sw and sh:
+                e2 = dict(elem)
+                e2['rel_x'] = (elem.get('rel_x', 0) * sw - min_left) / total_width
+                e2['rel_y'] = (elem.get('rel_y', 0) * sh - min_top) / total_height
+                e2['rel_width'] = elem.get('rel_width', 0.1) * sw / total_width * canvas_width * col
+                self._render_positioned_element(lines, e2, canvas_width, canvas_height)
+            else:
+                self._render_positioned_element(lines, elem, canvas_width, canvas_height)
 
         lines.append("\\end{tikzpicture}")
         lines.append("\\end{center}")
@@ -2557,16 +3098,88 @@ class PPTXToLatexConverter:
         else:
             lines.append(r"\begin{frame}{\secname\vspace{0.1cm}\\\textcolor{anthrazit!80!white}{\subsecname}}")
 
+        # Side-by-side layout: when all pictures lie entirely beside the body
+        # text in the original (left or right of it), text and pictures go into
+        # two columns. Emitting them one below the other pushed the pictures
+        # below the frame (images positioned for the right half of the slide
+        # were stacked under the bullet list).
+        side, split = None, None
+        text_extent = content.get('text_extent')
+        if content_items and images and text_extent and slide_width:
+            boxes = [(im.get('left'), im.get('width')) for im in images]
+            if all(l is not None and w for l, w in boxes):
+                img_left = min(l for l, _ in boxes)
+                img_right = max(l + w for l, w in boxes)
+                tol = 0.02 * slide_width
+                if img_left >= text_extent[1] - tol:
+                    side, split = 'right', 0.5 * (text_extent[1] + img_left) / slide_width
+                elif img_right <= text_extent[0] + tol:
+                    side, split = 'left', 0.5 * (img_right + text_extent[0]) / slide_width
+                else:
+                    # Full-width text placeholder holding short lines, pictures in
+                    # the right half next to the text: the text only fills the
+                    # left part of its box, so treat it as a two-column slide too.
+                    vext = content.get('text_vextent')
+                    tops = [im.get('top') for im in images]
+                    if (vext and all(t is not None for t in tops)
+                            and img_left > 0.45 * slide_width
+                            and content.get('text_maxchars', 999) <= 60
+                            and min(tops) < vext[1]):
+                        side, split = 'right', img_left / slide_width - 0.01
+        # Pictures both inside the text area (e.g. a drawing between two
+        # paragraphs) and beside it: the inner ones stay with the text column,
+        # the outer ones form the visual column.
+        text_side_images = []
+        if side is None and content_items and images and text_extent and slide_width:
+            boxes = [(im, im.get('left'), im.get('width')) for im in images]
+            if all(l is not None and w for _, l, w in boxes):
+                tol = 0.02 * slide_width
+                for cand_side in ('right', 'left'):
+                    if cand_side == 'right':
+                        beside = [b for b in boxes if b[1] >= text_extent[1] - tol]
+                        if not beside:
+                            continue
+                        cut = min(b[1] for b in beside)
+                        inner = [b for b in boxes if b not in beside]
+                        ok = inner and all(b[1] + b[2] <= cut + tol and b[1] + b[2] > text_extent[0] for b in inner)
+                    else:
+                        beside = [b for b in boxes if b[1] + b[2] <= text_extent[0] + tol]
+                        if not beside:
+                            continue
+                        cut = max(b[1] + b[2] for b in beside)
+                        inner = [b for b in boxes if b not in beside]
+                        ok = inner and all(b[1] >= cut - tol and b[1] < text_extent[1] for b in inner)
+                    if ok:
+                        side = cand_side
+                        split = cut / slide_width + (-0.01 if cand_side == 'right' else 0.01)
+                        text_side_images = [b[0] for b in inner]
+                        images = [b[0] for b in beside]
+                        break
+        text_side_elems, visual_elems = [], positioned_elements
+        if side:
+            cut = split
+            text_side_elems = [e for e in positioned_elements
+                               if ((e['rel_x'] + 0.5 * e.get('rel_width', 0)) < cut) == (side == 'right')]
+            visual_elems = [e for e in positioned_elements if e not in text_side_elems]
+
         # Add content as itemize if there are bullet points
+        text_lines = []
         if content_items:
             has_bullets = any(item.get('is_bullet', False) for item in content_items)
 
             if has_bullets:
                 strip_font_sizes = density['is_text_heavy']
-                lines.append("\\begin{itemize}")
+                text_lines.append("\\begin{itemize}")
                 current_level = 0
+                # Boxes whose paragraphs all sit at indent level >= 1 (or that
+                # jump by two levels) would open a nested itemize without an
+                # \\item ("Something's wrong--perhaps a missing \\item"):
+                # shift to the shallowest level and allow one step at a time.
+                min_level = min(it.get('level', 0) for it in content_items)
+                prev_level = -1
                 for item in content_items:
-                    level = item.get('level', 0)
+                    level = min(item.get('level', 0) - min_level, prev_level + 1)
+                    prev_level = level
                     text = item['text']
 
                     if strip_font_sizes:
@@ -2577,35 +3190,71 @@ class PPTXToLatexConverter:
                         )
 
                     while level > current_level:
-                        lines.append("  " * (current_level + 1) + "\\begin{itemize}")
+                        text_lines.append("  " * (current_level + 1) + "\\begin{itemize}")
                         current_level += 1
                     while level < current_level:
-                        lines.append("  " * current_level + "\\end{itemize}")
+                        text_lines.append("  " * current_level + "\\end{itemize}")
                         current_level -= 1
 
                     # Respect PowerPoint's per-paragraph bullet suppression
                     # (buNone): emit an empty label so the line is indented but
                     # shows no marker.
                     marker = "\\item " if item.get('has_marker', True) else "\\item[] "
-                    lines.append("  " * (level + 1) + marker + text)
+                    text_lines.append("  " * (level + 1) + marker + text)
 
                 while current_level > 0:
-                    lines.append("  " * current_level + "\\end{itemize}")
+                    text_lines.append("  " * current_level + "\\end{itemize}")
                     current_level -= 1
-                lines.append("\\end{itemize}")
+                text_lines.append("\\end{itemize}")
             else:
                 for item in content_items:
                     text = item['text']
-                    lines.append(f"{text}")
-                    lines.append("")
+                    text_lines.append(f"{text}")
+                    text_lines.append("")
+        # labels that belong to the text side of a two-column slide (those
+        # lying on a picture of the text side are drawn with that picture)
+        inner_elems = []
+        if text_side_images and getattr(self, 'slide_width_emu', None) and getattr(self, 'slide_height_emu', None):
+            sw, sh = self.slide_width_emu, self.slide_height_emu
+            il = min(im['left'] for im in text_side_images)
+            it_ = min(im['top'] for im in text_side_images)
+            ir = max(im['left'] + im['width'] for im in text_side_images)
+            ib = max(im['top'] + im['height'] for im in text_side_images)
+            for e in text_side_elems:
+                ex, ey = e.get('rel_x', 0) * sw, e.get('rel_y', 0) * sh
+                if il <= ex <= ir and it_ <= ey <= ib:
+                    inner_elems.append(e)
+        for e in text_side_elems:
+            if e in inner_elems:
+                continue
+            text_lines.append("")
+            text_lines.append("{\\small " + e['text'] + "}")
 
-        # Maximum image height
-        max_image_height = 0.75
+        # Maximum image height (a bit lower in a column next to the text)
+        max_image_height = 0.72 if side else 0.75
+        if side:
+            text_col = min(0.68, max(0.32, split)) if side == 'right' else min(0.68, max(0.32, 1.0 - split))
+            text_col = round(text_col - 0.01, 2)
+            visual_col = round(0.97 - text_col, 2)
+            self._column_factor = visual_col
+        needs_unified = (len(images) >= 2) or (bool(images) and bool(visual_elems)) if side else needs_unified_tikz
+        if text_side_images:
+            # pictures inside the text area, below the text of the text column
+            sh_emu = getattr(self, 'slide_height_emu', None) or 1
+            span = (max(im['top'] + im['height'] for im in text_side_images)
+                    - min(im['top'] for im in text_side_images)) / sh_emu
+            prev_factor = self._column_factor
+            self._column_factor = text_col
+            text_lines.append("")
+            text_lines.extend(self.render_unified_tikz(text_side_images, inner_elems,
+                                                       round(min(0.55, max(0.2, 1.05 * span)), 2)))
+            self._column_factor = prev_factor
 
         # Render images and positioned elements
-        if needs_unified_tikz:
+        visual_lines = []
+        if needs_unified:
             # Unified TikZ rendering for multiple images or images + shapes
-            lines.extend(self.render_unified_tikz(images, positioned_elements, max_image_height))
+            visual_lines.extend(self.render_unified_tikz(images, visual_elems, max_image_height))
         elif images:
             # Single image or overlapping images without positioned elements
             image_groups = self.group_overlapping_images(images)
@@ -2615,49 +3264,73 @@ class PPTXToLatexConverter:
                 for group in image_groups:
                     if len(group) == 1:
                         img_info = group[0]
-                        width_ratio = img_info.get('width_ratio', 0.8)
-                        lines.extend(self.render_image_with_overlays(img_info, width_ratio, max_image_height))
+                        width_ratio = 0.98 if side else img_info.get('width_ratio', 0.8)
+                        visual_lines.extend(self.render_image_with_overlays(img_info, width_ratio, max_image_height))
                     else:
-                        lines.append("% Overlapping images with animation")
-                        lines.append("\\begin{center}")
-                        lines.append("\\begin{tikzpicture}")
+                        visual_lines.append("% Overlapping images with animation")
+                        visual_lines.append("\\begin{center}")
+                        visual_lines.append("\\begin{tikzpicture}")
                         for idx, img_info in enumerate(group):
                             filename = img_info['filename']
-                            width_ratio = img_info.get('width_ratio', 0.8)
+                            width_ratio = 0.98 if side else img_info.get('width_ratio', 0.8)
                             if idx == 0:
-                                lines.append(f"  \\node[anchor=center] (img{idx}) {{\\includegraphics[width={width_ratio}\\textwidth,height={max_image_height}\\textheight,keepaspectratio]{{{filename}}}}};")
+                                visual_lines.append(f"  \\node[anchor=center] (img{idx}) {{\\includegraphics[width={width_ratio}\\textwidth,height={max_image_height}\\textheight,keepaspectratio]{{{filename}}}}};")
                             else:
                                 overlay_num = idx + 1
-                                lines.append(f"  \\onslide<{overlay_num}->{{\\node[anchor=center] at (img0.center) {{\\includegraphics[width={width_ratio}\\textwidth,height={max_image_height}\\textheight,keepaspectratio]{{{filename}}}}};}}")
-                        lines.append("\\end{tikzpicture}")
-                        lines.append("\\end{center}")
+                                visual_lines.append(f"  \\onslide<{overlay_num}->{{\\node[anchor=center] at (img0.center) {{\\includegraphics[width={width_ratio}\\textwidth,height={max_image_height}\\textheight,keepaspectratio]{{{filename}}}}};}}")
+                        visual_lines.append("\\end{tikzpicture}")
+                        visual_lines.append("\\end{center}")
             else:
                 for img_info in images:
-                    width_ratio = img_info.get('width_ratio', 0.8)
+                    width_ratio = 0.98 if side else img_info.get('width_ratio', 0.8)
                     if density['is_image_heavy'] and density['recommended_image_height']:
                         height_ratio = density['recommended_image_height']
                     else:
                         height_ratio = max_image_height
-                    lines.extend(self.render_image_with_overlays(img_info, width_ratio, height_ratio))
+                    visual_lines.extend(self.render_image_with_overlays(img_info, width_ratio, height_ratio))
         elif positioned_elements:
             # Only positioned elements, no images
-            lines.append("\\begin{center}")
-            lines.append("\\begin{tikzpicture}")
+            visual_lines.append("\\begin{center}")
+            visual_lines.append("\\begin{tikzpicture}")
             for elem in positioned_elements:
-                self._render_positioned_element(lines, elem, 0.9, max_image_height)
-            lines.append("\\end{tikzpicture}")
+                self._render_positioned_element(visual_lines, elem, 0.9, max_image_height)
+            visual_lines.append("\\end{tikzpicture}")
+            visual_lines.append("\\end{center}")
+        self._column_factor = 1.0
+
+        if side:
+            text_block = [f"\\begin{{column}}{{{text_col}\\textwidth}}"] + text_lines + ["\\end{column}"]
+            visual_block = [f"\\begin{{column}}{{{visual_col}\\textwidth}}"] + visual_lines + ["\\end{column}"]
+            lines.append("\\begin{columns}[T]")
+            lines.extend(text_block + visual_block if side == 'right' else visual_block + text_block)
+            lines.append("\\end{columns}")
+        else:
+            lines.extend(text_lines)
+            lines.extend(visual_lines)
+
+        # Add tables (converted PowerPoint tables)
+        for tab in content.get('tables', []):
+            lines.append("\\begin{center}")
+            lines.append(tab)
             lines.append("\\end{center}")
 
-        # Add videos
+        # Add videos (with their own poster frame when available). \\pptxvideo
+        # (theme) links the poster to the clip with a relative Launch action:
+        # works in Acrobat on Windows/macOS, SumatraPDF, Okular and pdfpc, unlike
+        # movie15, which needs pdfLaTeX and Acrobat's legacy multimedia.
         for vid in videos:
-            lines.append(f"% Video: {vid}")
-            lines.append("\\includemovie[")
-            lines.append("    inline=false,")
-            lines.append("    attach=false,")
-            lines.append("    autoplay,")
-            lines.append(f"    text={{\\includegraphics[width=0.9\\textwidth,height={max_image_height}\\textheight,keepaspectratio]{{videos/generic-thumbnail.jpg}}}}")
-            vid_path = "videos/" + vid
-            lines.append(f"]{{0.9\\textwidth}}{{{max_image_height}\\textheight}}{{{vid_path}}}")
+            poster = self.video_posters.get(vid, 'generic-thumbnail.jpg')
+            lines.append(f"% Video: {vid} (keep the videos/ folder next to the PDF)")
+            lines.append(f"\\begin{{center}}\\pptxvideo[0.9\\textwidth]{{videos/{vid}}}{{videos/{poster}}}\\end{{center}}")
+
+        # PowerPoint equations (OMML) are not converted: flag them so they are not lost silently
+        try:
+            n_math = slide._element.xml.count('<m:oMath>') + slide._element.xml.count('<m:oMath ')
+        except Exception:
+            n_math = 0
+        if n_math:
+            lines.append(f"% TODO: slide {slide_num} contains {n_math} PowerPoint equation(s) (OMML) "
+                         "that were not converted - retype them in LaTeX")
 
         # Add source command if sources were found
         if sources:
@@ -2709,6 +3382,10 @@ class PPTXToLatexConverter:
         # Get slide dimensions for image sizing
         slide_width = prs.slide_width
         slide_height = prs.slide_height
+        # kept for render_unified_tikz, which maps images (EMU) and positioned
+        # text elements (slide fractions) into one common bounding box
+        self.slide_width_emu = slide_width
+        self.slide_height_emu = slide_height
 
         # Detect source aspect ratio for proper coordinate transformation
         source_ratio = self.detect_aspect_ratio(slide_width, slide_height)
@@ -2730,11 +3407,16 @@ class PPTXToLatexConverter:
         for i, slide in enumerate(prs.slides):
             if i == 0 and self.is_title_slide(slide, i):
                 continue
-            if self.is_section_divider(slide) or self.is_thank_you_slide(slide):
+            if self.is_pure_section_divider(slide) or self.is_thank_you_slide(slide):
                 continue
             if self.slide_needs_raster(slide):
                 raster_targets.append(i + 1)
-        self.raster_map = self._rasterize_slides(raster_targets)
+                continue
+            clusters = self.find_vector_clusters(slide, prs.slide_width, prs.slide_height)
+            if clusters:
+                self.crop_map[i + 1] = clusters
+        self.raster_map = self._rasterize_slides(raster_targets, self.crop_map)
+        self.crop_map = {n: [c for c in cl if c.get('filename')] for n, cl in self.crop_map.items()}
 
         # Process each slide and organize by section
         #
@@ -2772,8 +3454,10 @@ class PPTXToLatexConverter:
 
             # Section-divider slide: open a new chapter/section. The theme draws
             # the divider page automatically via \AtBeginSection, so we do not
-            # render the slide body itself.
-            if self.is_section_divider(slide):
+            # render the slide body itself. Section-header slides that carry
+            # pictures, videos, tables or charts are content slides and fall
+            # through to the normal frame conversion below.
+            if self.is_pure_section_divider(slide):
                 chapter = self.get_slide_title(slide) or (slide.slide_layout.name or "Section")
                 current_chapter = chapter
                 print(f"  Slide {slide_num}: section divider -> '{chapter}'")
@@ -2866,10 +3550,11 @@ class PPTXToLatexConverter:
         # Get presentation name without extension
         pptx_name = self.input_path.stem
 
-        # Create output in tex-output subfolder (relative to script location)
+        # Create output in tex-output subfolder (relative to script location),
+        # unless --output-dir points elsewhere (keeps this repository clean)
         script_dir = Path(__file__).parent
-        tex_output_dir = script_dir / 'tex-output'
-        tex_output_dir.mkdir(exist_ok=True)
+        tex_output_dir = self.output_root if self.output_root else script_dir / 'tex-output'
+        tex_output_dir.mkdir(parents=True, exist_ok=True)
 
         # Create presentation-specific folder
         output_folder = tex_output_dir / pptx_name
@@ -3080,7 +3765,9 @@ class PPTXToLatexConverter:
         print(f"  Main file: beamer-main.tex")
         print(f"  Section files: {len(conversion_data['sections'])}")
 
-        print(f"Converted: {self.input_path} -> {self.output_path}")
+        # (self.output_path is the historical positional argument and is not
+        # used: the output always lands in <output folder>/beamer-main.tex)
+        print(f"Converted: {self.input_path} -> {main_tex_path}")
         print(f"  Images saved to: {self.fig_dir}/")
         print(f"  Videos saved to: {self.video_dir}/")
 
@@ -3115,6 +3802,12 @@ Examples:
         '--video-dir',
         default='videos',
         help='Directory for extracted videos (default: videos)'
+    )
+    parser.add_argument(
+        '--output-dir',
+        default=None,
+        help='Parent folder of the output folder <presentation-name>/ '
+             '(default: tex-output/ next to this script)'
     )
 
     args = parser.parse_args()
@@ -3151,7 +3844,8 @@ Examples:
                 str(input_path),
                 str(output_path),
                 fig_dir=args.fig_dir,
-                video_dir=args.video_dir
+                video_dir=args.video_dir,
+                output_root=args.output_dir
             )
             converter.save()
         except Exception as e:
